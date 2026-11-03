@@ -329,3 +329,29 @@ in unchanged `docs/source` files. These include duplicate labels, short
 title underlines, and an invalid YAML code-block directive in
 `legacy/production/observability/chunk_statistics.rst:291`.
 The log is `/tmp/kvc-cpu-docs-build.log`. No shared environment was modified.
+
+## M3c. Prefetch destinations stay private until terminal completion
+
+```bash
+CUDA_VISIBLE_DEVICES='' LMCACHE_TRACK_USAGE=false PYTHONPATH="$PWD" \
+  /scratch/akira/lmcache-dev/bin/python -m pytest \
+  --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
+  tests/v1/distributed/test_l1_write_operations.py \
+  tests/v1/distributed/test_prefetch_write_operations.py \
+  tests/v1/distributed/test_prefetch_controller.py \
+  tests/v1/distributed/test_l1_manager.py
+```
+
+Recorded on 2026-11-03 at `562301cf`: **167 passed, zero skipped**.
+The eight new write/prefetch lifetime cases use native CPU allocations and
+controlled adapters. They hold writes past TTL, verify partial bytes remain
+unreadable, reject stale/foreign completion handles, preserve an existing
+same-key resident, and retain destinations during aborted or timed out
+loads. Terminal failures discard their destinations. Ambiguous submissions
+keep affected allocations pinned and report that process exit is required.
+Known accepted tasks and unsubmitted buffers are cleaned up independently.
+These cases verify LMCache's adapter contract; they do not establish native
+TCP, RDMA, or GPU failure completion.
+
+The contract is documented in
+[the prefetch design](docs/design/v1/distributed/storage_controllers/prefetch_controller.md).
