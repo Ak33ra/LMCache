@@ -7,7 +7,7 @@ prove controller ownership, not native SDK or transport fencing.
 
 # Standard
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import multiprocessing
 import threading
 import time
@@ -541,3 +541,62 @@ def test_uncertain_acceptance_quarantines_staging() -> None:
         if child.is_alive():
             child.kill()
             child.join(timeout=5)
+
+
+@pytest.mark.parametrize("invalid", ["foreign", "copied", "stale", "wrong-key"])
+def test_invalid_capability_rejects_whole_batch(invalid: str) -> None:
+    """Reject bad capabilities after a valid item without taking either buffer."""
+    manager, foreign = make_manager(3), make_manager(1)
+    adapter = ControlledStoreAdapter()
+    controller = make_controller(manager, adapter, DefaultStorePolicy())
+    controller.start()
+    operations = reserve(manager, (KEY, OTHER_KEY))
+    foreign_operations = reserve(foreign, (OTHER_KEY,))
+    submitted = operations.copy()
+    if invalid == "foreign":
+        submitted[OTHER_KEY] = foreign_operations[OTHER_KEY]
+    elif invalid == "copied":
+        submitted[OTHER_KEY] = replace(operations[OTHER_KEY])
+    elif invalid == "stale":
+        discard(manager, {OTHER_KEY: operations.pop(OTHER_KEY)})
+    else:
+        submitted[ObjectKey(ObjectKey.IntHash2Bytes(3), "staged-store", 0)] = (
+            submitted.pop(OTHER_KEY)
+        )
+    try:
+        with pytest.raises(ValueError):
+            controller.submit_staged_write_operations(submitted, adapter_id=ADAPTER_ID)
+        controller.stop(timeout=5)
+        assert adapter.accepted_count() == 0
+        discard(manager, operations)
+        discard(foreign, foreign_operations)
+        assert manager.get_memory_usage()[0] == 0
+        assert foreign.get_memory_usage()[0] == 0
+    finally:
+        adapter.close()
+        manager.close()
+        foreign.close()
+
+
+def test_accepted_capability_cannot_be_submitted_or_finished_twice() -> None:
+    """A transfer revokes the caller handle while native reads remain pending."""
+    manager, adapter = make_manager(), ControlledStoreAdapter()
+    controller = make_controller(manager, adapter, DefaultStorePolicy())
+    controller.start()
+    operations = reserve(manager)
+    future = controller.submit_staged_write_operations(operations, adapter_id=ADAPTER_ID)
+    adapter.wait_submitted()
+    try:
+        with pytest.raises(ValueError):
+            controller.submit_staged_write_operations(operations, adapter_id=ADAPTER_ID)
+        with pytest.raises(ValueError):
+            discard(manager, operations)
+        assert manager.get_memory_usage()[0] == 4096
+        adapter.complete(1, L2StoreResult(True, 4096))
+        assert future.result(timeout=5).admitted_keys == frozenset([KEY])
+        controller.stop(timeout=5)
+        assert adapter.accepted_count() == 1
+        assert manager.get_memory_usage()[0] == 0
+    finally:
+        adapter.close()
+        manager.close()
