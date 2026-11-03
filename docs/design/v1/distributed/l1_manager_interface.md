@@ -16,6 +16,11 @@ without changes on the caller side.
   `memory_region_count`, `memcheck`, `close`. An implementation that cannot
   honour a call answers with the documented `L1Error` codes instead of
   raising, so the callers keep one code path.
+- Explicit allocation readers use `acquire_read_operations`,
+  `finish_read_operations`, and `reclaim_discarded_read_operations`.
+  Invalid completion capabilities raise `ValueError` without partially
+  releasing a batch. Their allocation ownership is independent of session
+  TTLs; see [the lifetime contract](l1_manager.md#explicit-allocation-read-operations).
 - It is `runtime_checkable`; `L1Manager` declares it explicitly
   (`class L1Manager(L1ManagerInterface)`) so the contract is visible at the
   implementation site, not only at the call sites.

@@ -207,3 +207,29 @@ behavior, inference integration, capacity exhaustion, concurrent admission,
 crash recovery, active-transfer cancellation, operation lifetime safety,
 transport fencing, physical backing release, or online resizing. Inline
 store acknowledgment alone is not used as shared-admission evidence.
+
+## M3a. Explicit L1 allocation read ownership
+
+Use the U0 CPU environment and compiled common native extension.
+
+```bash
+python -m pytest --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
+  tests/v1/distributed/test_l1_read_operations.py \
+  tests/v1/distributed/test_l1_manager.py
+```
+
+Expected result is **105 passed, zero skipped**. The new six cases use real
+4096-byte CPU pools and native TTL locks. A held operation survives TTL
+expiry, ordinary/forced delete and clear, and an unsuccessful close. The slot
+cannot be reused until operation completion. Reusing that same address and
+key then rejects the old handle without releasing the replacement.
+Other checks cover whole-batch rejection of copied, foreign, repeated, and
+already completed handles; the 128-operation admission limit; temporary
+objects; and deferred discard across legacy-reader expiry and key reuse.
+
+Recorded on 2026-11-03. Adding these six cases to the full U0a command gave
+**317 passed, zero skipped**, with expected OpenTelemetry warnings. This unit
+adds the ownership API while existing Store and serving callers still use
+their prior paths. It does not yet fix those callers, prefetch destination
+writes, cancellation, native completion semantics, transport fencing, or
+online removal of a backing segment.

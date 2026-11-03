@@ -30,6 +30,28 @@ if TYPE_CHECKING:
 L1OperationResult = tuple[L1Error, "MemoryObj | None"]
 
 
+@dataclass(frozen=True, eq=False)
+class L1ReadOperation:
+    """Process-local capability pinning one allocation until explicit completion.
+
+    Only the issuing manager can release this exact handle. Keeping a handle
+    alive does not itself complete it; cancellation must wait for buffer access
+    to finish before releasing it. Handles are not serializable reservations.
+
+    Attributes:
+        manager_id: Identity of the issuing L1 manager.
+        operation_id: Unique operation within that manager.
+        memory_obj: The allocation owned by this operation.
+    """
+
+    manager_id: int
+    operation_id: int
+    memory_obj: MemoryObj
+
+
+L1ReadOperationResult = tuple[L1Error, L1ReadOperation | None]
+
+
 @dataclass(frozen=True)
 class L1MemoryDesc:
     """Describe the contiguous L1 memory arena exposed to external backends.
@@ -277,6 +299,25 @@ class L1ManagerInterface(Protocol):
         self, keys: list[ObjectKey], read_locks: int = 1
     ) -> dict[ObjectKey, L1OperationResult]:
         """Take ``read_locks`` read locks on each resident key."""
+        ...
+
+    def acquire_read_operations(
+        self, keys: list[ObjectKey]
+    ) -> dict[ObjectKey, L1ReadOperationResult]:
+        """Pin each resident allocation until its exact operation completes."""
+        ...
+
+    def finish_read_operations(
+        self,
+        operations: list[L1ReadOperation],
+        *,
+        discard: frozenset[L1ReadOperation] = frozenset(),
+    ) -> None:
+        """Release valid operations; mark selected allocations for discard."""
+        ...
+
+    def reclaim_discarded_read_operations(self) -> int:
+        """Reclaim discarded allocations with no readers; return those still pending."""
         ...
 
     def unsafe_read(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1OperationResult]:
