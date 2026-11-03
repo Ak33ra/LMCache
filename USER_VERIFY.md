@@ -229,7 +229,63 @@ objects; and deferred discard across legacy-reader expiry and key reuse.
 
 Recorded on 2026-11-03. Adding these six cases to the full U0a command gave
 **317 passed, zero skipped**, with expected OpenTelemetry warnings. This unit
-adds the ownership API while existing Store and serving callers still use
-their prior paths. It does not yet fix those callers, prefetch destination
+adds the ownership API. M3b below converts Store callers; this API unit alone
+does not fix legacy callers, prefetch destination
 writes, cancellation, native completion semantics, transport fencing, or
 online removal of a backing segment.
+
+## M3b. Store exports hold exact source allocations
+
+```bash
+python -m pytest --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
+  tests/v1/distributed/test_store_read_operations.py \
+  tests/v1/distributed/test_store_controller.py
+```
+
+Expected result is **28 passed, zero skipped**. A controlled adapter pauses
+an actual read of a native CPU buffer past its TTL. Forced clear and a timed
+out shutdown must keep the source pinned. Releasing the reader lets a second
+shutdown complete, and the copied bytes must match the originals. The cases
+cover retained stores, successful discard, and a failed terminal store.
+Another case accepts the buffer, then raises before returning the task ID.
+Its isolated child verifies that the source remains readable and cannot be
+reclaimed; status requires process exit because acceptance cannot be resolved.
+The adapter in these tests is controlled Python code.
+
+Adding both M3 test files to U0a gives **321 passed, zero skipped**, recorded
+on 2026-11-03. Both U2 commands also passed against the real CPU native
+Mooncake binding after this wiring. Their final evidence is in
+`/tmp/kvc-m3b-native-default` and `/tmp/kvc-m3b-native-skip-l1`; inspect each
+`summary.json` for expected and observed counts plus process exit statuses.
+
+Runtime adapter changes and interface compatibility also passed:
+
+```bash
+python -m pytest --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
+  tests/v1/distributed/test_runtime_adapters.py \
+  tests/v1/distributed/test_l1_interface.py
+```
+
+Expected result is **15 passed, zero skipped**. Eleven runtime adapter tests
+use native L1 with mock L2 adapters; their module gate now admits CPU and
+rejects source-only native stubs. Four structural interface tests replace
+allocation helpers with ordinary torch buffers and are not native-allocation
+integration evidence.
+
+The lifetime contract and remaining limits are in
+[the Store design](docs/design/v1/distributed/storage_controllers/store_controller.md).
+Native success-path verification does not prove native failure fencing,
+prefetch destination lifetime, serving-read lifetime, or segment removal.
+
+The Sphinx build was attempted using the existing docs-only environment:
+
+```bash
+PYTHONPATH="$PWD" /scratch/akira/kvc-worktrees/dram-segments-docs-env/bin/sphinx-build \
+  -b html -W --keep-going docs/source docs/build/html
+```
+
+It generated HTML but failed the warnings-as-errors gate with 26 diagnostics
+in unchanged `docs/source` files. These include duplicate labels, short
+title underlines, and an invalid YAML code-block directive in
+`legacy/production/observability/chunk_statistics.rst:291`.
+The log is `/tmp/kvc-cpu-docs-build.log`. No shared environment was modified.

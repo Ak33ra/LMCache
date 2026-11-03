@@ -10,9 +10,7 @@ the full integration without mocking internals.
 """
 
 # Standard
-from typing import NoReturn
 import select
-import threading
 import time
 
 # Third Party
@@ -42,7 +40,6 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
     StorePolicy,
 )
 from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
-from lmcache.v1.memory_management import MemoryObj
 from tests.v1.distributed.utils import should_use_lazy_alloc
 
 if not getattr(lmcache_native, "__file__", None):
@@ -173,6 +170,16 @@ def make_descriptor(index: int) -> L2AdapterDescriptor:
 class TestStoreListener:
     """Test StoreListener as a standalone component."""
 
+    def test_stopped_listener_drops_pending_and_future_notifications(self) -> None:
+        """Failed or blocked shutdown cannot accumulate an unbounded write queue."""
+        listener = StoreListener()
+        listener.on_l1_keys_write_finished([make_object_key(1)])
+        listener.stop_admission()
+        listener.on_l1_keys_write_finished([make_object_key(2)])
+        assert listener.pending_count() == 0
+        assert listener.pop_pending_keys() == []
+        listener.close()
+
     def test_pop_pending_keys_returns_empty_initially(self):
         """A fresh listener should have no pending keys."""
         listener = StoreListener()
@@ -295,41 +302,6 @@ class TestStoreControllerSingleAdapter:
 
         assert adapter.debug_get_stored_object_count() == 0
         assert l1_manager.delete(keys)[keys[0]] == L1Error.SUCCESS
-
-        ctrl.stop()
-        adapter.close()
-
-    def test_submit_failure_releases_l1_read_lock(self, l1_manager, monkeypatch):
-        """An adapter submission failure should not leak L1 read locks."""
-        adapter = make_adapter()
-        submission_attempted = threading.Event()
-
-        def fail_submit(
-            _keys: list[ObjectKey],
-            _memory_objs: list[MemoryObj],
-        ) -> NoReturn:
-            submission_attempted.set()
-            raise RuntimeError("injected store submission failure")
-
-        monkeypatch.setattr(adapter, "submit_store_task", fail_submit)
-        ctrl = StoreController(
-            l1_manager=l1_manager,
-            l2_adapters=[adapter],
-            adapter_descriptors=[make_descriptor(0)],
-            policy=DefaultStorePolicy(),
-        )
-        ctrl.start()
-
-        layout = make_layout()
-        keys = [make_object_key(0)]
-        write_keys_to_l1(l1_manager, keys, layout)
-
-        assert submission_attempted.wait(timeout=5.0)
-        ok = wait_for_condition(
-            lambda: l1_manager.report_status()["read_locked_count"] == 0,
-            timeout=5.0,
-        )
-        assert ok, "Submission failure should release the acquired L1 read lock"
 
         ctrl.stop()
         adapter.close()
@@ -726,15 +698,6 @@ class TestBufferOnlyMode:
     ):
         """A key still being read when its L2 store finishes leaves L1 once
         the reader is done."""
-        delete_called = threading.Event()
-        delete = l1_manager.delete
-
-        def watched_delete(*args, **kwargs):
-            result = delete(*args, **kwargs)
-            delete_called.set()
-            return result
-
-        monkeypatch.setattr(l1_manager, "delete", watched_delete)
         # Slow enough that the read lock below is taken before the store ends.
         adapter = MockL2Adapter(
             MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=0.001)
@@ -752,7 +715,9 @@ class TestBufferOnlyMode:
         write_keys_to_l1(l1_manager, keys, make_layout())
         assert l1_manager.reserve_read(keys)[keys[0]][0] == L1Error.SUCCESS
 
-        assert delete_called.wait(5.0), "L2 store should finish and try L1 delete"
+        assert wait_for_condition(
+            lambda: l1_manager.report_status()["pending_discard_count"] == 1
+        ), "L2 store should finish and mark its allocation for discard"
         assert l1_manager.get_object_state(keys[0]) is not None
 
         l1_manager.finish_read(keys)
