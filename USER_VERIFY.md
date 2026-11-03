@@ -507,3 +507,52 @@ no diagnostics for the new admission page. The build logs are
 
 The implementation contract is in
 [the mirrored admission design](docs/design/v1/distributed/l1-admission.md).
+
+
+## U4b. Unpublished computed Store admission
+
+Run from this checkout. The staged tests use 4 to 12 KiB native CPU pools;
+existing controller regressions use at most 128 MiB per pool.
+
+```bash
+CUDA_VISIBLE_DEVICES='' LMCACHE_TRACK_USAGE=false \
+  PYTHONPATH="$PWD" NUMBA_CACHE_DIR=/tmp/kvc-numba-staged-store-verify \
+  /scratch/akira/lmcache-dev/bin/python -m pytest \
+  --confcutdir=tests/v1/distributed -q -o log_cli=false \
+  tests/v1/distributed/test_store_staged_admission.py \
+  tests/v1/distributed/test_store_read_operations.py \
+  tests/v1/distributed/test_store_controller.py \
+  tests/v1/distributed/test_runtime_adapters.py
+```
+
+Recorded on 2026-11-03 with Python 3.12.13 and the compiled common native
+extension. This command passed **54 tests, zero skipped**, including 14 new
+staged-admission cases, after integration with U4a's typed L1 admission API.
+The only pytest warnings were the existing OpenTelemetry logging-handler
+deprecation.
+
+The staged checks delay actual CPU source reads beyond the write TTL, force
+clear, time out and retry shutdown, fail whole batches, cancel observation,
+overlap same-key sources, and preserve a resident. A Future callback checks
+that allocator usage and active write handles are already zero. Other cases
+check temporary quota release, explicit adapter IDs, rejected ownership
+transfer, mixed resident and staged completions, no resident notification,
+and process-isolated uncertain submission. Unknown acceptance keeps its
+handles and unresolved Future until process exit. Safely undispatched queued
+batches are discarded and report failure.
+
+These are controlled Python-adapter tests with native CPU allocations and
+locks. They do not prove live Store admission, SDK error fencing, or network
+behavior. The native staged Store roundtrip remains a separate activation
+gate after the native control-queue repair. This unit does not activate MP
+partition configuration.
+
+Ruff 0.11.7, isort 6.0.1, mypy 1.17.1, codespell 2.4.1, and `git diff --check`
+pass for the changed content. The contract and rationale are in
+[the Store source design](docs/design/v1/distributed/storage_controllers/store_controller.md#unpublished-computed-write-admission).
+
+The final test log is `/tmp/kvc-staged-store-final-tests.log`. The Sphinx
+command from U4a was also run with output directory
+`/tmp/kvc-staged-store-docs`. It fails on 26 existing diagnostics that also occur on
+base `3744a7e0`, with none for this Markdown-only documentation change. The
+log is `/tmp/kvc-staged-store-docs.log`.

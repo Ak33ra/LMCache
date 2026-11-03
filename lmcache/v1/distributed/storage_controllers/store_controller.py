@@ -4,13 +4,15 @@ Store Controller: asynchronously copies data from L1 to L2 after writes complete
 
 The controller runs a background thread with an event-driven loop that:
 1. Listens for L1 write-completion events via StoreListener.
+   It also accepts explicit handoffs of unpublished write operations.
 2. Submits store tasks to L2 adapters based on StorePolicy decisions.
 3. Monitors L2 task completion via event fds.
-4. Completes allocation-bound read operations, optionally discarding their data.
+4. Releases exact source capabilities after terminal adapter completion.
 """
 
 # Standard
 from collections import Counter, defaultdict
+from concurrent.futures import Future
 from dataclasses import dataclass
 import enum
 import select
@@ -25,6 +27,7 @@ from lmcache.v1.distributed.internal_api import (
     L1ManagerInterface,
     L1ManagerListener,
     L1ReadOperation,
+    L1WriteOperation,
 )
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
@@ -182,6 +185,32 @@ class StorePhase(enum.Enum):
     L2_STORE = enum.auto()
 
 
+@dataclass(frozen=True)
+class StoreAdmissionResult:
+    """Whole-task shared admission outcome after local staging is released."""
+
+    admitted_keys: frozenset[ObjectKey]
+    failed_keys: frozenset[ObjectKey]
+
+
+@dataclass(frozen=True)
+class ResidentExport:
+    """Read capabilities for already published L1 objects."""
+
+    operations: tuple[L1ReadOperation, ...]
+
+
+@dataclass(frozen=True)
+class StagedAdmission:
+    """Unpublished allocations and their cleanup-before-completion promise."""
+
+    operations: tuple[L1WriteOperation, ...]
+    completion: Future[StoreAdmissionResult]
+
+
+StoreSource = ResidentExport | StagedAdmission
+
+
 @dataclass
 class InFlightStoreTask:
     """
@@ -195,7 +224,7 @@ class InFlightStoreTask:
     keys: list[ObjectKey]
     """All keys that were submitted in this store task."""
 
-    read_operations: list[L1ReadOperation]
+    source: StoreSource
     """One allocation capability per key, held through adapter completion."""
 
     l2_store_result: bool | None = None
@@ -223,6 +252,8 @@ class StoreController(StorageControllerInterface):
        tasks to L2 adapters.
     4. On L2 task completion: releases operations, atomically marking their
        allocations for discard per policy.
+       Explicit staged admissions always discard and resolve their result only
+       after cleanup, without publishing or notifying a resident write.
 
     Args:
         l1_manager: The L1 manager instance.
@@ -266,6 +297,9 @@ class StoreController(StorageControllerInterface):
         # loop thread
         self._adapter_ops_lock = threading.Lock()
         self._pending_adapter_ops: list[AddAdapterOp | RemoveAdapterOp] = []
+        self._pending_staged_admissions: list[InFlightStoreTask] = []
+        # Target eligibility and staged queue admission share the shutdown lock.
+        self._staged_adapter_ids = set(self._l2_adapters)
         self._adapter_ctrl_efd = create_event_notifier()
 
         self._listener = StoreListener()
@@ -346,7 +380,8 @@ class StoreController(StorageControllerInterface):
             Adapter completion must mean local source-buffer access has ended;
             it does not prove remote transport or shared-segment quiescence.
         """
-        self._stop_flag.set()
+        with self._adapter_ops_lock:
+            self._stop_flag.set()
         self._listener.stop_admission()
         if self._thread.is_alive():
             self._listener.notify()
@@ -362,14 +397,70 @@ class StoreController(StorageControllerInterface):
         if StoreController._gauge_targets.get(self._l1_manager.config.tag) is self:
             del StoreController._gauge_targets[self._l1_manager.config.tag]
 
+    def submit_staged_write_operations(
+        self,
+        operations: dict[ObjectKey, L1WriteOperation],
+        *,
+        adapter_id: int,
+    ) -> Future[StoreAdmissionResult]:
+        """Transfer unpublished source ownership to one explicit adapter.
+
+        Args:
+            operations: Keys and original active write handles from this L1
+                manager, all with the same layout. The caller must finish
+                writing before handoff and must not access or complete accepted
+                handles afterward. Keys must match their reserved handles.
+            adapter_id: Stable descriptor index of the target adapter.
+
+        Returns:
+            A future resolving after terminal adapter completion and exact
+            staging discard. A failed task fails every key in its batch.
+            Cancellation only cancels observation; it never releases ownership.
+            Unknown submission acceptance quarantines handles and leaves the
+            future unresolved until process exit.
+
+        Raises:
+            ValueError: The target is unavailable, shapes differ, or handles
+                repeat. No ownership transfers on rejection.
+            RuntimeError: The controller is not running or has stopped
+                admission. The caller retains all handles.
+
+        Accepted submissions drain during shutdown. Queued submissions that
+        have not reached an adapter when acceptance becomes uncertain fail
+        safely. Buffers are never published to L1 or routed by StorePolicy.
+        """
+        keys = list(operations)
+        handles = tuple(operations.values())
+        if len(set(handles)) != len(handles):
+            raise ValueError("Repeated staged write operation")
+        if len(_group_keys_by_shape(keys)) > 1:
+            raise ValueError("Staged write operations must share one shape")
+        completion: Future[StoreAdmissionResult] = Future()
+        task = InFlightStoreTask(adapter_id, keys, StagedAdmission(handles, completion))
+        with self._adapter_ops_lock:
+            if self._stop_flag.is_set() or not self._thread.is_alive():
+                raise RuntimeError("StoreController is not accepting staged writes")
+            if adapter_id not in self._staged_adapter_ids:
+                raise ValueError(f"Store adapter {adapter_id} is unavailable")
+            if not keys:
+                completion.set_result(StoreAdmissionResult(frozenset(), frozenset()))
+                return completion
+            # Notify before appending so notifier failure cannot transfer ownership.
+            self._adapter_ctrl_efd.notify()
+            self._pending_staged_admissions.append(task)
+        return completion
+
     def report_status(self) -> dict:
         """Return a status dict for the store controller."""
         is_healthy = self._thread.is_alive() and not self._unresolved_submissions
         num_draining = len(self._draining)
+        with self._adapter_ops_lock:
+            pending_staged = len(self._pending_staged_admissions)
         return {
             "is_healthy": is_healthy,
             "thread_alive": self._thread.is_alive(),
             "pending_keys_count": self._listener.pending_count(),
+            "pending_staged_admission_count": pending_staged,
             "in_flight_task_count": self._status_in_flight_count,
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - num_draining,
@@ -377,7 +468,14 @@ class StoreController(StorageControllerInterface):
             "deferred_l1_deletion_count": self._deferred_l1_deletion_count,
             "unresolved_submission_count": len(self._unresolved_submissions),
             "unresolved_read_operation_count": sum(
-                len(task.read_operations) for task in self._unresolved_submissions
+                len(task.source.operations)
+                for task in self._unresolved_submissions
+                if isinstance(task.source, ResidentExport)
+            ),
+            "unresolved_write_operation_count": sum(
+                len(task.source.operations)
+                for task in self._unresolved_submissions
+                if isinstance(task.source, StagedAdmission)
             ),
             "requires_process_exit": bool(self._unresolved_submissions),
         }
@@ -430,6 +528,7 @@ class StoreController(StorageControllerInterface):
         """
         op = RemoveAdapterOp(adapter_id=adapter_id, done=threading.Event())
         with self._adapter_ops_lock:
+            self._staged_adapter_ids.discard(adapter_id)
             self._pending_adapter_ops.append(op)
         self._adapter_ctrl_efd.notify()
         return op.done
@@ -493,9 +592,17 @@ class StoreController(StorageControllerInterface):
         for efd in self._efd_to_adapter_index:
             poller.register(efd, select.POLLIN)
 
-        while not self._stop_flag.is_set() or self._in_flight_tasks:
+        while True:
             # First, apply runtime add/remove of the L2 adapters.
             self._apply_pending_adapter_ops(poller)
+            self._submit_pending_staged_admissions()
+            with self._adapter_ops_lock:
+                if (
+                    self._stop_flag.is_set()
+                    and not self._in_flight_tasks
+                    and not self._pending_staged_admissions
+                ):
+                    break
 
             ready = poller.poll(STORE_LOOP_POLL_TIMEOUT_MS)
 
@@ -561,35 +668,55 @@ class StoreController(StorageControllerInterface):
         with self._adapter_ops_lock:
             ops = self._pending_adapter_ops
             self._pending_adapter_ops = []
-        for op in ops:
-            if isinstance(op, AddAdapterOp):
-                self._l2_adapters[op.adapter_id] = op.adapter
-                self._adapter_descriptors[op.adapter_id] = op.descriptor
-                efd = op.adapter.get_store_event_fd()
-                self._efd_to_adapter_index[efd] = op.adapter_id
-                poller.register(efd, select.POLLIN)
-                logger.info("StoreController attached adapter %d", op.adapter_id)
-                op.done.set()
-            elif isinstance(op, RemoveAdapterOp):
-                if op.adapter_id not in self._l2_adapters:
-                    # Already gone (double remove); signal so the caller
-                    # doesn't block.
+            for op in ops:
+                if isinstance(op, AddAdapterOp):
+                    self._l2_adapters[op.adapter_id] = op.adapter
+                    self._adapter_descriptors[op.adapter_id] = op.descriptor
+                    efd = op.adapter.get_store_event_fd()
+                    self._efd_to_adapter_index[efd] = op.adapter_id
+                    poller.register(efd, select.POLLIN)
+                    self._staged_adapter_ids.add(op.adapter_id)
+                    logger.info("StoreController attached adapter %d", op.adapter_id)
                     op.done.set()
-                    continue
-                # Mark draining; routing skips it immediately. The adapter
-                # stays registered so in-flight completions still process.
-                self._draining[op.adapter_id] = op.done
-                logger.info(
-                    "StoreController draining adapter %d (no new stores routed)",
-                    op.adapter_id,
-                )
+                elif isinstance(op, RemoveAdapterOp):
+                    self._staged_adapter_ids.discard(op.adapter_id)
+                    if op.adapter_id not in self._l2_adapters:
+                        # Already gone (double remove); signal so the caller
+                        # doesn't block.
+                        op.done.set()
+                        continue
+                    # Mark draining; routing skips it immediately. The adapter
+                    # stays registered so in-flight completions still process.
+                    self._draining[op.adapter_id] = op.done
+                    logger.info(
+                        "StoreController draining adapter %d (no new stores routed)",
+                        op.adapter_id,
+                    )
 
     def _adapter_in_use(self, adapter_id: int) -> bool:
         """True if any in-flight store task targets ``adapter_id``."""
         for task_adapter_id, _ in self._in_flight_tasks:
             if task_adapter_id == adapter_id:
                 return True
-        return False
+        return any(
+            task.adapter_index == adapter_id for task in self._unresolved_submissions
+        )
+
+    def _submit_pending_staged_admissions(self) -> None:
+        """Drain transferred writes, including batches accepted before stop."""
+        with self._adapter_ops_lock:
+            tasks = self._pending_staged_admissions
+            self._pending_staged_admissions = []
+        for task in tasks:
+            source = task.source
+            assert isinstance(source, StagedAdmission)
+            if self._unresolved_submissions:
+                self._l1_manager.finish_write_operations(
+                    list(source.operations), discard=frozenset(source.operations)
+                )
+                self._resolve_staged_admission(task, success=False)
+            else:
+                self._submit_task(task)
 
     def _finalize_drained_adapters(self, poller: "select.poll") -> None:
         """Detach draining adapters that no longer have in-flight tasks."""
@@ -667,7 +794,6 @@ class StoreController(StorageControllerInterface):
                 break
 
             successful_keys = []
-            successful_objs = []
             read_operations: list[L1ReadOperation] = []
             not_found_keys: list[ObjectKey] = []
             write_locked_keys: list[ObjectKey] = []
@@ -685,7 +811,6 @@ class StoreController(StorageControllerInterface):
                     )
                     continue
                 successful_keys.append(key)
-                successful_objs.append(operation.memory_obj)
                 read_operations.append(operation)
 
             # L1 read-failure anomaly reporting: target_keys come from an
@@ -717,56 +842,55 @@ class StoreController(StorageControllerInterface):
             if not successful_keys:
                 continue
 
-            adapter = self._l2_adapters[adapter_index]
-            try:
-                task_id = adapter.submit_store_task(successful_keys, successful_objs)
-            except Exception:
-                logger.exception(
-                    "Unknown store acceptance at adapter %d for %d keys; "
-                    "source buffers remain pinned until process exit.",
+            self._submit_task(
+                InFlightStoreTask(
                     adapter_index,
-                    len(successful_keys),
-                )
-                self._unresolved_submissions.append(
-                    InFlightStoreTask(adapter_index, successful_keys, read_operations)
-                )
-                self._stop_flag.set()
-                self._listener.stop_admission()
-                continue
-
-            self._in_flight_tasks[(adapter_index, task_id)] = InFlightStoreTask(
-                adapter_index=adapter_index,
-                keys=successful_keys,
-                read_operations=read_operations,
-            )
-            self._status_in_flight_count += 1
-
-            # All objects for a single store task share one layout (L1
-            # allocates uniform MemoryObjs per chunk), so total bytes is
-            # size * count — avoids summing N identical values.
-            total_bytes = successful_objs[0].get_size() * len(successful_objs)
-            self._event_bus.publish(
-                Event(
-                    event_type=EventType.L2_STORE_SUBMITTED,
-                    metadata={
-                        "adapter_index": adapter_index,
-                        "task_id": task_id,
-                        "l2_name": self._adapter_descriptors[adapter_index].type_name,
-                        "key_count": len(successful_keys),
-                        "total_bytes": total_bytes,
-                        "key_count_per_salt": Counter(
-                            k.cache_salt for k in successful_keys
-                        ),
-                    },
+                    successful_keys,
+                    ResidentExport(tuple(read_operations)),
                 )
             )
 
-            logger.debug(
-                "Submitted store task %d to adapter %d with %d keys.",
-                task_id,
+    def _submit_task(self, task: InFlightStoreTask) -> None:
+        """Submit either source capability, quarantining ambiguous acceptance."""
+        adapter_index = task.adapter_index
+        objects = [operation.memory_obj for operation in task.source.operations]
+        adapter = self._l2_adapters[adapter_index]
+        try:
+            task_id = adapter.submit_store_task(task.keys, objects)
+        except Exception:
+            logger.exception(
+                "Unknown store acceptance at adapter %d for %d keys; "
+                "source buffers remain pinned until process exit.",
                 adapter_index,
-                len(successful_keys),
+                len(task.keys),
             )
+            self._unresolved_submissions.append(task)
+            with self._adapter_ops_lock:
+                self._stop_flag.set()
+            self._listener.stop_admission()
+            return
+
+        self._in_flight_tasks[(adapter_index, task_id)] = task
+        self._status_in_flight_count += 1
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L2_STORE_SUBMITTED,
+                metadata={
+                    "adapter_index": adapter_index,
+                    "task_id": task_id,
+                    "l2_name": self._adapter_descriptors[adapter_index].type_name,
+                    "key_count": len(task.keys),
+                    "total_bytes": sum(obj.get_size() for obj in objects),
+                    "key_count_per_salt": Counter(k.cache_salt for k in task.keys),
+                },
+            )
+        )
+        logger.debug(
+            "Submitted store task %d to adapter %d with %d keys.",
+            task_id,
+            adapter_index,
+            len(task.keys),
+        )
 
     def _drain_l2_store_completions(self, signaled_adapters: set[int]) -> None:
         """Deposit each signaled adapter's L2 outcomes onto their in-flight
@@ -809,15 +933,22 @@ class StoreController(StorageControllerInterface):
         l1_mgr = self._l1_manager
         success = task.l2_store_result
 
-        delete_keys = (
-            set(self._policy.select_l1_deletions(task.keys)) if success else set()
-        )
-        discard = frozenset(
-            operation
-            for key, operation in zip(task.keys, task.read_operations, strict=True)
-            if key in delete_keys
-        )
-        l1_mgr.finish_read_operations(task.read_operations, discard=discard)
+        if isinstance(task.source, ResidentExport):
+            delete_keys = (
+                set(self._policy.select_l1_deletions(task.keys)) if success else set()
+            )
+            discard = frozenset(
+                operation
+                for key, operation in zip(
+                    task.keys, task.source.operations, strict=True
+                )
+                if key in delete_keys
+            )
+            l1_mgr.finish_read_operations(list(task.source.operations), discard=discard)
+        else:
+            l1_mgr.finish_write_operations(
+                list(task.source.operations), discard=frozenset(task.source.operations)
+            )
         del self._in_flight_tasks[task_key]
         self._status_in_flight_count -= 1
 
@@ -863,3 +994,19 @@ class StoreController(StorageControllerInterface):
                 adapter_index,
                 task.keys,
             )
+        self._resolve_staged_admission(task, success=bool(success))
+
+    def _resolve_staged_admission(
+        self, task: InFlightStoreTask, *, success: bool
+    ) -> None:
+        """Resolve observation only after source cleanup, tolerating cancellation."""
+        if isinstance(task.source, StagedAdmission):
+            completion = task.source.completion
+            if completion.set_running_or_notify_cancel():
+                keys = frozenset(task.keys)
+                completion.set_result(
+                    StoreAdmissionResult(
+                        admitted_keys=keys if success else frozenset(),
+                        failed_keys=frozenset() if success else keys,
+                    )
+                )
