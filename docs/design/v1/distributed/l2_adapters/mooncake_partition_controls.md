@@ -30,11 +30,11 @@ store into a separately allocated shared segment.
 | Method | Meaning |
 | --- | --- |
 | `register_l1_buffer(base, size)` | Register caller-owned backing and return a fresh numeric ID. An identical live registration returns its existing ID. Overlap is rejected. |
-| `unregister_l1_buffer(id)` | Release the exact transport registration. The caller still owns and must separately free its backing. |
+| `unregister_l1_buffer(id)` | Release the exact transport registration after all accepted futures are drained. The caller still owns and must separately free its backing. |
 | `allocate_shared_segment(size)` | Allocate and mount SDK-owned backing; return its segment IDs and actual accounting snapshot. |
 | `release_shared_segment(id)` | Immediately unmount, fence, and release one SDK-owned segment. No grace-period admission is mistaken for release. |
 | `partition_status()` | Read cached confirmed ownership and pending growth without waiting for SDK I/O. |
-| `close_partition()` | Attempt quiescence, stop admission, drain workers, and tear down the SDK. Retry incomplete close while retaining backing. |
+| `close_partition()` | Return `BUSY` while accepted futures remain undrained, then stop admission and tear down the SDK. Retry incomplete close while retaining backing. |
 
 Results contain a `PartitionControlCode`, the original `sdk_error` (or `-1`
 for a C++ exception), relevant
@@ -59,25 +59,47 @@ issuing growth, and must not count pending bytes twice.
 
 ## Access and teardown ordering
 
-Every native worker holds shared SDK access through the complete Store call,
-including terminal transfer completion. Controls use an exclusive try-lock.
-An active worker or another control produces `BUSY` without changing ownership.
-The separate snapshot mutex is never held across SDK I/O.
+All four native submissions share one admission path in partition mode. It
+rejects closing or closed connectors before queue insertion. Get and set also
+validate registered ranges before acceptance. Each accepted batch owns a pending
+future entry until `drain_completions()` returns its terminal result. Callers
+must retain the actual backing and its Python buffers until then. The binding
+passes raw addresses and does not retain Python buffer objects for callers.
 
-Unregister removes only the selected registration. A queued get/set validates
-its pointer range again after acquiring SDK access, so a request that reaches a
-retired span fails before dereferencing it. Growth and release serialize through
-the same guard. This excludes local worker access while mutating SDK ownership.
-The SDK's remote generation and terminal-completion fences provide the separate
-remote-access guarantee.
+Unregister and close return `BUSY` while any pending entry remains, even when a
+worker has finished but its result is undrained. This deliberately retains all
+registrations for each batch, including metadata requests. A queued operation
+therefore prevents unregister followed by same-address registration reuse.
+Once the caller drains every accepted result, unregister can succeed and a
+later registration receives a fresh ID. The old work can no longer access it.
 
-Close first acquires exclusive access without waiting. If busy, it leaves
-admission and all charges unchanged. Once exclusive, it marks closing so queued
-workers fail, then joins workers and invokes SDK teardown. A failed close keeps
-its snapshot and external registrations available for retry. `close()` raises
-when partition close is incomplete. The destructor reports unresolved ownership;
-it is not a substitute for successful explicit close. Callers must keep the
-connector and all private backing alive after an error.
+The ownership model is `list<optional<future_id>>`. Admission reserves an empty
+entry before calling the base connector, then assigns the returned ID without
+allocation. An exception during base submission leaves an unresolved entry.
+Its ownership cannot be inferred from a missing future, so unregister and close
+remain `BUSY`; callers retain backing until process exit. Input validation
+fails before reserving an entry. Admission and drain share a mutex so a fast
+completion cannot be drained before its entry receives the ID.
+
+Every worker holds shared SDK access through terminal Store completion.
+Admission also holds shared access. Controls use an exclusive try-lock, then
+unregister and close try the submission mutex. Drain takes only the submission
+mutex. An active worker or another control produces `BUSY` without changing
+ownership. The separate snapshot mutex is never held across SDK I/O. The SDK's
+remote generation fence provides the separate remote-access guarantee.
+
+Close leaves admission and charges unchanged if either lock or pending ownership
+prevents quiescence. Once no accepted work remains, it marks closing, joins the
+idle workers while retaining exclusive access, and invokes SDK teardown. New
+submissions raise synchronously, including after a failed SDK teardown. A failed
+close keeps ownership available for retry. `close()` raises when partition close
+is incomplete. The destructor reports unresolved ownership; it is not a
+substitute for successful explicit close.
+
+This design keeps `ConnectorBase` and other backends unchanged. Binding exact
+registration tokens into base requests was the alternative. It would allow
+unrelated registrations to retire sooner, but requires a wider queue contract
+change. Conservative pending ownership fits the current quiescent controls.
 
 ## Manual evidence
 
@@ -110,7 +132,10 @@ The probe uses real native source/destination buffers and a real master. It
 checks private-registration isolation from Store allocation capacity, exact
 bytes after source mutation, repeated shared growth/release, actual rounded
 sizes, stale IDs, worker-busy retries, visible pending growth, and final scratch
-release. `/proc/self/maps` independently reports whether each tested shared
+release. It also checks queued get/set behind a paused-master request,
+completed-but-undrained ownership, 128 concurrent submissions with drain,
+same-address re-registration, and all four submissions racing with close or
+arriving after close. `/proc/self/maps` reports whether each tested shared
 mapping disappeared. The requested size is 64 MiB plus one byte; the actual size
 is read from the snapshot, not assumed. The probe's paused master establishes
 control behavior, not transfer performance. It does not exercise cross-host,
@@ -123,6 +148,16 @@ released segment mappings were absent. The failed mount and failed close
 retained 80 MiB plus 8 MiB scratch; retry after metadata recovery reached zero.
 Logs and JSON are under `/tmp/kvc-native-controls-final` and
 `/tmp/kvc-native-controls-final-recovery`, with matching `.log` files.
+
+The 2026-11-03 queue repair reproduced the old post-close pending future and
+unregister of a completed-but-undrained request. The extended normal and
+recovery probes then passed against SDK `170e8df`. Each drained 128 concurrent
+submissions and checked queued data, same-address replacement bytes, all four
+post-close rejections, and close races with both empty and undrained queues.
+Evidence is in `/tmp/kvc-native-queue-verified` and
+`/tmp/kvc-native-queue-verified-recovery`, with matching `.log` files.
+Ambiguous C++ allocation exceptions were not fault-injected. See
+`USER_VERIFY.md` for the old failure logs, commands, and scope limits.
 
 The same connector compiled against stock 0.3.14 and reported API version 0.
 Partition mode rejected before setup. A separate real stock master completed

@@ -655,3 +655,44 @@ and passed default native set/get/delete with exact bytes against its own real
 master (`/tmp/kvc-native-controls-stock-build.log` and
 `/tmp/kvc-native-controls-stock.log`). Stock compatibility is not ownership
 safety evidence. Sphinx retained the existing 26 warning baseline.
+
+### M4a queue ownership repair
+
+Rebuild the native extension before repeating the two M4a commands above.
+The extended probe requires unregister and close to return `BUSY` for accepted
+requests until their terminal results are drained. This includes completed but
+undrained requests. All get, set, exists, and delete submissions must raise
+after close starts or succeeds. Retain the connector and backing after an
+ambiguous submission exception; unresolved acceptance requires process exit.
+
+Recorded on 2026-11-03 against strict CPU SDK `170e8df`. Both extended probes
+passed with zero skips. Each exercised queued get/set behind a paused master,
+128 concurrent submissions with a simultaneous drain, same-address replacement
+with exact bytes, and four close races. Two races began empty and rejected all
+four operations after close. Two began with an undrained future, returned
+`BUSY`, and completed all four new operations before retrying close. The
+recovery probe also rejected all four submissions after failed SDK teardown.
+Final private, shared, failed, and scratch charges were zero.
+
+The real old extension first reproduced a post-close future that never
+completed. The extended probe then failed with
+`Completed-but-undrained work lost its registration ownership`.
+Evidence and build logs are:
+
+- `/tmp/kvc-native-queue-baseline-postclose.log` and
+  `/tmp/kvc-native-queue-baseline.log` contain the old failures.
+- `/tmp/kvc-native-queue-verified/summary.json` and
+  `/tmp/kvc-native-queue-verified-recovery/summary.json` contain the passing
+  results, with matching `.log` files.
+- `/tmp/kvc-native-queue-build-final.log` contains the isolated API 1 build.
+
+The probe retains two 64 KiB caller mappings, at most one 80 MiB shared
+allocation, and 8 MiB SDK scratch at a time. These are cache backing sizes;
+Python, torch, native metadata, and process RSS are additional. It does not
+inject C++ allocation exceptions or prove cross-host, GPU, or RDMA behavior.
+Sphinx generated HTML but retained the same 26 existing warnings, including
+the unchanged invalid code-block directive. The log is
+`/tmp/kvc-native-queue-docs.log`. Ruff, isort, and whitespace checks passed.
+The repaired source also built against stock 0.3.14 as API 0 and passed its
+real-master default constructor set/get/delete byte check. Logs are
+`/tmp/kvc-native-queue-stock-build.log` and `/tmp/kvc-native-queue-stock.log`.

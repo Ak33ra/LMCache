@@ -125,6 +125,14 @@ mounted shared segments. Private deregistration releases transport registration
 only; the caller still owns its backing. Keep private backing alive until
 explicit cleanup succeeds.
 
+Keep submitted buffers alive until their terminal results are returned by
+``drain_completions()``. Unregister and close return ``BUSY`` while accepted
+work is queued, active, or completed but undrained. Drain the results and retry.
+Partition get/set reject unregistered ranges at admission. All four submission
+methods raise ``RuntimeError`` once close starts or succeeds. An exception
+during native submission can leave unresolved ownership without a future ID;
+in that case retain the connector and backing until process exit.
+
 The build and live-master verification commands are documented in
 ``docs/design/v1/distributed/l2_adapters/mooncake_partition_controls.md``.
 The checked-in probe is

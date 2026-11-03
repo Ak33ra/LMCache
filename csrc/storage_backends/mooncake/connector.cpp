@@ -111,6 +111,82 @@ void MooncakeConnector::close() {
   ConnectorBase<WorkerMooncakeConn>::close();
 }
 
+uint64_t MooncakeConnector::submit_batch_get(
+    const std::vector<std::string>& keys, const std::vector<void*>& bufs,
+    const std::vector<size_t>& lens, size_t batch_chunk_num_bytes) {
+  return submit_batch(Op::BATCH_TILE_GET, keys, bufs, lens,
+                      batch_chunk_num_bytes);
+}
+
+uint64_t MooncakeConnector::submit_batch_set(
+    const std::vector<std::string>& keys, const std::vector<void*>& bufs,
+    const std::vector<size_t>& lens, size_t batch_chunk_num_bytes) {
+  return submit_batch(Op::BATCH_TILE_SET, keys, bufs, lens,
+                      batch_chunk_num_bytes);
+}
+
+uint64_t MooncakeConnector::submit_batch_exists(
+    const std::vector<std::string>& keys) {
+  return submit_batch(Op::BATCH_TILE_EXISTS, keys, {}, {}, 0);
+}
+
+uint64_t MooncakeConnector::submit_batch_delete(
+    const std::vector<std::string>& keys) {
+  return submit_batch(Op::BATCH_TILE_DELETE, keys, {}, {}, 0);
+}
+
+std::vector<Completion> MooncakeConnector::drain_completions() {
+  if (!partition_controls_)
+    return ConnectorBase<WorkerMooncakeConn>::drain_completions();
+  std::lock_guard<std::mutex> admission(submission_mutex_);
+  auto completions = ConnectorBase<WorkerMooncakeConn>::drain_completions();
+  for (const auto& completion : completions) {
+    pending_submissions_.remove(completion.future_id);
+  }
+  return completions;
+}
+
+uint64_t MooncakeConnector::submit_batch(Op op,
+                                         const std::vector<std::string>& keys,
+                                         const std::vector<void*>& bufs,
+                                         const std::vector<size_t>& lens,
+                                         size_t batch_chunk_num_bytes) {
+  auto submit = [&] {
+    switch (op) {
+      case Op::BATCH_TILE_GET:
+        return ConnectorBase<WorkerMooncakeConn>::submit_batch_get(
+            keys, bufs, lens, batch_chunk_num_bytes);
+      case Op::BATCH_TILE_SET:
+        return ConnectorBase<WorkerMooncakeConn>::submit_batch_set(
+            keys, bufs, lens, batch_chunk_num_bytes);
+      case Op::BATCH_TILE_EXISTS:
+        return ConnectorBase<WorkerMooncakeConn>::submit_batch_exists(keys);
+      case Op::BATCH_TILE_DELETE:
+        return ConnectorBase<WorkerMooncakeConn>::submit_batch_delete(keys);
+    }
+    throw std::logic_error("Unknown Mooncake batch operation");
+  };
+  if (!partition_controls_) return submit();
+
+  std::shared_lock<std::shared_mutex> access(sdk_mutex_);
+  std::lock_guard<std::mutex> admission(submission_mutex_);
+  if (partition_closing_)
+    throw std::runtime_error("Mooncake partition is closing or closed");
+  if (keys.empty()) throw std::runtime_error("keys list is empty");
+  if (op == Op::BATCH_TILE_GET || op == Op::BATCH_TILE_SET) {
+    if (keys.size() != bufs.size() || keys.size() != lens.size())
+      throw std::runtime_error("keys, bufs, and lens size mismatch");
+    for (size_t i = 0; i < bufs.size(); ++i) {
+      ensure_registered(bufs[i], lens[i]);
+    }
+  }
+  // Reserve ownership before base submission can enqueue or throw. Assigning
+  // the returned ID cannot allocate; exceptions keep an unresolved entry.
+  auto& pending = pending_submissions_.emplace_back();
+  pending = submit();
+  return *pending;
+}
+
 WorkerMooncakeConn MooncakeConnector::create_connection() {
   WorkerMooncakeConn conn;
   conn.client = client_.get();
@@ -531,6 +607,9 @@ PartitionControlResult MooncakeConnector::unregister_l1_buffer(uint64_t id) {
   const auto admission = control_admission();
   if (admission != PartitionControlCode::SUCCESS)
     return control_result(admission);
+  std::unique_lock<std::mutex> submissions(submission_mutex_, std::try_to_lock);
+  if (!submissions.owns_lock() || !pending_submissions_.empty())
+    return control_result(PartitionControlCode::BUSY);
   auto found = local_buffers_.find(id);
   if (found == local_buffers_.end())
     return control_result(PartitionControlCode::INVALID);
@@ -608,11 +687,12 @@ PartitionControlResult MooncakeConnector::close_partition() {
   if (!access.owns_lock()) return control_result(PartitionControlCode::BUSY);
   if (partition_status().closed)
     return control_result(PartitionControlCode::SUCCESS);
+  std::unique_lock<std::mutex> submissions(submission_mutex_, std::try_to_lock);
+  if (!submissions.owns_lock() || !pending_submissions_.empty())
+    return control_result(PartitionControlCode::BUSY);
   partition_closing_ = true;
   refresh_partition_status();
-  access.unlock();
   ConnectorBase<WorkerMooncakeConn>::close();
-  access.lock();
   const auto before = partition_status();
   const int rc = control_sdk_call([&] { return client_->tearDownAll(); });
   if (rc == 0) local_buffers_.clear();
