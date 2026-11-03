@@ -421,7 +421,8 @@ class StoreController(StorageControllerInterface):
 
         Raises:
             ValueError: The target is unavailable, shapes differ, or handles
-                repeat. No ownership transfers on rejection.
+                repeat, are stale, copied, foreign, or bound to another key.
+                No ownership transfers on rejection.
             RuntimeError: The controller is not running or has stopped
                 admission. The caller retains all handles.
 
@@ -429,6 +430,7 @@ class StoreController(StorageControllerInterface):
         have not reached an adapter when acceptance becomes uncertain fail
         safely. Buffers are never published to L1 or routed by StorePolicy.
         """
+        operations = operations.copy()
         keys = list(operations)
         handles = tuple(operations.values())
         if len(set(handles)) != len(handles):
@@ -436,7 +438,6 @@ class StoreController(StorageControllerInterface):
         if len(_group_keys_by_shape(keys)) > 1:
             raise ValueError("Staged write operations must share one shape")
         completion: Future[StoreAdmissionResult] = Future()
-        task = InFlightStoreTask(adapter_id, keys, StagedAdmission(handles, completion))
         with self._adapter_ops_lock:
             if self._stop_flag.is_set() or not self._thread.is_alive():
                 raise RuntimeError("StoreController is not accepting staged writes")
@@ -447,6 +448,9 @@ class StoreController(StorageControllerInterface):
                 return completion
             # Notify before appending so notifier failure cannot transfer ownership.
             self._adapter_ctrl_efd.notify()
+            transferred = self._l1_manager.transfer_write_operations(operations)
+            source = StagedAdmission(tuple(transferred.values()), completion)
+            task = InFlightStoreTask(adapter_id, keys, source)
             self._pending_staged_admissions.append(task)
         return completion
 

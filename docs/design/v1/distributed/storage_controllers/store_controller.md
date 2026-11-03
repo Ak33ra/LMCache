@@ -73,7 +73,12 @@ adapter. The controller does not infer a shared target from `StorePolicy`.
 Each handoff contains one shape, matching the adapter's whole-task contract.
 The keys must correspond to the original active handles from this controller's
 L1 manager. The writer must finish all local writes before calling and must
-not access or complete accepted handles afterward.
+not access or complete accepted handles afterward. L1 validates every key and
+original active handle before replacing any capability. Successful transfer
+revokes the caller handles and returns new handles to the controller, so the
+same source cannot be accepted twice. The existing L1 operation registry owns
+this transition; the controller needs no second ownership registry. A foreign,
+copied, stale, or wrongly keyed handle rejects the entire batch.
 
 `ResidentExport` holds read capabilities for published objects.
 `StagedAdmission` holds write capabilities and a

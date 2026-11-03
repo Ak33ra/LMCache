@@ -22,7 +22,10 @@ without changes on the caller side.
   releasing a batch. Their allocation ownership is independent of session
   TTLs; see [the lifetime contract](l1_manager.md#explicit-allocation-read-operations).
 - Explicit destinations use `reserve_write_operations` and
-  `finish_write_operations`. Prefetch holds these immutable capabilities until
+  `finish_write_operations`. `transfer_write_operations` validates a complete
+  key-to-handle batch and replaces its capabilities atomically. Rejection
+  preserves every caller handle; success revokes them in favor of the returned
+  handles without releasing allocations. Prefetch holds these capabilities until
   adapters end local buffer access. Successful completion atomically admits
   serving reads; failed completion discards the exact destination. See
   [write ownership](l1_manager.md#explicit-destination-write-operations).

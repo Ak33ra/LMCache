@@ -723,3 +723,45 @@ MQ regression run plus the first ten bounds cases passed **29 tests**, with
 nine unrelated tests deselected. Ruff lint/format, isort, and `git diff --check`
 passed for changed Python files. The documentation is internal Markdown; no
 Sphinx build or live Mooncake integration is claimed for this unit.
+
+## U4c. Validate staged capabilities before transfer
+
+Run from this checkout with the compiled common native extension available.
+The added cases use 4 to 12 KiB pools. Existing regression pools are at most
+128 MiB.
+
+```bash
+CUDA_VISIBLE_DEVICES='' LMCACHE_TRACK_USAGE=false PYTHONPATH="$PWD" \
+  NUMBA_CACHE_DIR=/tmp/kvc-numba-validation \
+  /scratch/akira/lmcache-dev/bin/python -m pytest \
+  --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
+  tests/v1/distributed/test_store_staged_admission.py \
+  tests/v1/distributed/test_l1_write_operations.py \
+  tests/v1/distributed/test_store_read_operations.py \
+  tests/v1/distributed/test_store_controller.py \
+  tests/v1/distributed/test_runtime_adapters.py \
+  tests/v1/distributed/test_l1_admission.py \
+  tests/v1/distributed/test_prefetch_write_operations.py
+```
+
+On 2026-11-03 this passed **86 tests, zero skipped** in 41.85 seconds with
+Python 3.12.13, torch 2.15.0+cu132, and native CPU L1 allocations. The log is
+`/tmp/kvc-validation-regressions.log`. The pre-fix wrong-key regression failed
+with `DID NOT RAISE ValueError` in `/tmp/kvc-validation-red.log`.
+
+Foreign, copied, stale, and wrongly keyed handles reject before adapter
+submission. Each invalid batch starts with a valid handle; completing all
+original valid handles afterward proves rejection did not partially transfer
+ownership. The adapter accepts zero tasks and controller shutdown completes.
+Accepted transfers revoke caller handles without releasing storage. Two
+simultaneous submissions accept exactly one owner, then terminal completion
+releases the allocation. These tests use controlled Python adapters and do not
+claim live Store transport evidence.
+
+Ruff 0.11.7, isort 6.0.1, codespell 2.4.1, and whitespace checks pass.
+Mypy 1.17.1 passes the three production modules and staged-admission tests.
+Including `test_l1_write_operations.py` reports two existing nullable-tensor
+errors at lines 134–135, outside this change. Sphinx was run with
+`-W --keep-going -b html docs/source /tmp/kvc-validation-docs` using the
+existing `dram-segments-docs-env`; it reports the same 26 baseline diagnostics
+recorded in U4b. Its log is `/tmp/kvc-validation-docs.log`.
