@@ -1,0 +1,14 @@
+{
+  "mooncake_version": "0.3.14",
+  "python": "3.12.13",
+  "native_extension": "/scratch/akira/kvc-worktrees/store-owned/lmcache/lmcache_native.cpython-312-x86_64-linux-gnu.so",
+  "script_sha256": "d3af86f83c2d47cf0659f56cb32ed24955a528af7dc296f7c8198e36a8bafbb6",
+  "observations": {
+    "source_bytes": 4096,
+    "identical_v2_header_replayed": true,
+    "new_registration_bytes_returned_to_old_header": true,
+    "gate": "blocked_v2_header_has_no_registration_generation",
+    "topology": "raw_loopback_TCP_socket_in_owner_process",
+    "peer": "127.0.0.1:56297"
+  }
+}

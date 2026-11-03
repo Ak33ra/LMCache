@@ -3,6 +3,7 @@
 
 # Standard
 import argparse
+from collections.abc import Callable
 import ctypes
 import gc
 import hashlib
@@ -14,6 +15,7 @@ from multiprocessing.connection import Connection
 import os
 from pathlib import Path
 import socket
+import signal
 import subprocess
 import sys
 import time
@@ -225,13 +227,15 @@ def lend_probe(
             )
             del obj, borrowed
             gc.collect()
-            records.append({
-                "cycle": cycle,
-                "shared_peer_bytes": len(payload),
-                "private_consumed_bytes": SEGMENT_BYTES,
-                "arena_backing_bytes": os.fstat(fd).st_size,
-                "store_mappings_after_unmount": mapping_count(name) - 1,
-            })
+            records.append(
+                {
+                    "cycle": cycle,
+                    "shared_peer_bytes": len(payload),
+                    "private_consumed_bytes": SEGMENT_BYTES,
+                    "arena_backing_bytes": os.fstat(fd).st_size,
+                    "store_mappings_after_unmount": mapping_count(name) - 1,
+                }
+            )
     finally:
         if mounted_ids:
             require(store.unmount_segment(mounted_ids, 0) == 0, "Final unmount failed")
@@ -253,7 +257,15 @@ def lend_probe(
     }
 
 
-def run_probe(mode: str, output: Path, cycles: int, grace_seconds: int) -> dict:
+def run_probe(
+    mode: str,
+    output: Path,
+    cycles: int,
+    grace_seconds: int,
+    observation: (
+        Callable[[MooncakeDistributedStore, Connection, str], dict] | None
+    ) = None,
+) -> dict:
     """Start an isolated master and two clients, retaining the native log."""
     output.mkdir(parents=True, exist_ok=True)
     master_port, metadata_port, metrics_port = free_port(), free_port(), free_port()
@@ -261,14 +273,25 @@ def run_probe(mode: str, output: Path, cycles: int, grace_seconds: int) -> dict:
     metadata_addr = f"http://127.0.0.1:{metadata_port}/metadata"
     master_binary = Path(next(iter(mooncake.__path__))) / "mooncake_master"
     log = (output / f"{mode}-master.log").open("w")
-    master = subprocess.Popen([
-        str(master_binary), "--rpc_address=127.0.0.1", f"--rpc_port={master_port}",
-        "--rpc_thread_num=2", "--handler_worker_thread_num=2",
-        "--enable_http_metadata_server=true", "--http_metadata_server_host=127.0.0.1",
-        f"--http_metadata_server_port={metadata_port}", "--metrics_host=127.0.0.1",
-        f"--metrics_port={metrics_port}", "--enable_metric_reporting=false",
-        "--enable_offload=false", "--logtostderr=true",
-    ], stdout=log, stderr=subprocess.STDOUT)
+    master = subprocess.Popen(
+        [
+            str(master_binary),
+            "--rpc_address=127.0.0.1",
+            f"--rpc_port={master_port}",
+            "--rpc_thread_num=2",
+            "--handler_worker_thread_num=2",
+            "--enable_http_metadata_server=true",
+            "--http_metadata_server_host=127.0.0.1",
+            f"--http_metadata_server_port={metadata_port}",
+            "--metrics_host=127.0.0.1",
+            f"--metrics_port={metrics_port}",
+            "--enable_metric_reporting=false",
+            "--enable_offload=false",
+            "--logtostderr=true",
+        ],
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
     owner = None
     peer = None
     parent_connection = None
@@ -285,43 +308,75 @@ def run_probe(mode: str, output: Path, cycles: int, grace_seconds: int) -> dict:
         owner = setup_store(master_addr, metadata_addr, 0)
         context = multiprocessing.get_context("spawn")
         parent_connection, child_connection = context.Pipe()
-        peer = context.Process(target=peer_process, args=(
-            child_connection, master_addr, metadata_addr,
-            SEGMENT_BYTES if mode == "placement" else 0,
-        ))
+        peer = context.Process(
+            target=peer_process,
+            args=(
+                child_connection,
+                master_addr,
+                metadata_addr,
+                SEGMENT_BYTES if mode == "placement" else 0,
+            ),
+        )
         peer.start()
         child_connection.close()
         require(parent_connection.poll(30), "Peer setup timed out")
         peer_name = parent_connection.recv()
-        if mode == "placement":
+        if observation is not None:
+            result = observation(owner, parent_connection, metadata_addr)
+        elif mode == "placement":
             result = placement_probe(owner, parent_connection)
         else:
             result = lend_probe(owner, parent_connection, cycles, grace_seconds)
         result["peer"] = peer_name
         return result
     finally:
-        if parent_connection is not None and peer is not None and peer.is_alive():
-            parent_connection.send(("close", ""))
-            peer.join(15)
-            if peer.is_alive():
-                peer.terminate()
-                peer.join(5)
-        if parent_connection is not None:
-            parent_connection.close()
-        if owner is not None:
-            owner.close()
-        master.terminate()
-        try:
-            master.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            master.kill()
-            master.wait()
-        log.close()
-        if peer is not None:
+        original_error = sys.exception()
+        cleanup_errors = []
+
+        def close_peer() -> None:
+            if peer is not None:
+                if peer.is_alive() and parent_connection is not None:
+                    try:
+                        parent_connection.send(("close", ""))
+                    except (BrokenPipeError, EOFError, OSError):
+                        pass
+                peer.join(15)
+                if peer.is_alive():
+                    peer.terminate()
+                    peer.join(5)
+                if peer.is_alive():
+                    peer.kill()
+                    peer.join(5)
+                require(peer.exitcode == 0, f"Peer exit status: {peer.exitcode}")
+
+        def close_master() -> None:
+            master.terminate()
+            try:
+                master.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                master.kill()
+                master.wait(timeout=5)
             require(
-                peer.exitcode == 0,
-                f"Peer did not shut down cleanly: {peer.exitcode}",
+                master.returncode in (0, -signal.SIGTERM),
+                f"Master exit status: {master.returncode}",
             )
+
+        cleanup = [close_peer]
+        if parent_connection is not None:
+            cleanup.append(parent_connection.close)
+        if owner is not None:
+            cleanup.append(owner.close)
+        cleanup.extend([close_master, log.close])
+        for close in cleanup:
+            try:
+                close()
+            except Exception as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            if original_error is not None:
+                original_error.add_note(f"Cleanup also failed: {cleanup_errors!r}")
+            else:
+                raise ExceptionGroup("Probe cleanup failed", cleanup_errors)
 
 
 def main() -> None:

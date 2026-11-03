@@ -130,3 +130,74 @@ alternative.
 [real-client]: https://github.com/kvcache-ai/Mooncake/blob/e1ea5d31bb5e46ff2df9f90e7c2fbaf52fcdee8c/mooncake-store/src/real_client.cpp#L2186
 [client]: https://github.com/kvcache-ai/Mooncake/blob/e1ea5d31bb5e46ff2df9f90e7c2fbaf52fcdee8c/mooncake-store/src/client_service.cpp#L3972
 [allocator]: lmcache/v1/memory_allocators/tensor_memory_allocator.py
+
+## SDK-owned backing and concurrent TCP reads
+
+The second runner uses real SDK allocation and native LMCache L1 locks.
+Run it in the environment above. It requires the ignored native extension
+in this worktree, built with `NO_GPU_EXT=1 python setup.py build_ext --inplace`
+or copied from the identical baseline build.
+
+```bash
+python tools/partitioning/probe_sdk_handoff.py \
+    --mode handoff --cycles 3 --output /tmp/kvc-sdk-handoff
+python tools/partitioning/probe_sdk_handoff.py \
+    --mode tcp-read --tcp-policy drain-first --output /tmp/kvc-tcp-safe
+python tools/partitioning/probe_sdk_handoff.py \
+    --mode tcp-read --tcp-policy repro --output /tmp/kvc-tcp-repro
+python tools/partitioning/probe_sdk_handoff.py \
+    --mode stale-header --output /tmp/kvc-tcp-stale
+```
+
+A zero exit means the expected observation occurred. Inspect `gate` before
+using a result as acceptance evidence. The repro and stale-header modes
+intentionally record blocked gates. Both retain source allocations until
+completion and never free an active source. The largest source is 64 MiB;
+SDK scratch is 8 MiB per client. The owner runs a real raw loopback TCP
+socket against native SDK server threads in the same process. The lending
+and handoff modes additionally use the separate SDK peer process.
+
+Measured on 2026-11-03 with wheel 0.3.14, Python 3.12.13 and the baseline
+native LMCache extension:
+
+| Observation | Result |
+| --- | --- |
+| SDK-owned shared/private/shared backing, three cycles | A 16 MiB + 1 request rounds to 32 MiB. The Store range is unmapped before private allocation; the private range is unmapped before the next Store allocation. |
+| Real L1 native read reservation | Deletion fails while reserved, succeeds after completion, and usage returns to zero. |
+| Drain-first TCP read | All 64 MiB arrives before unregister. No capacity is granted while incomplete. |
+| Unregister during an accepted TCP read | Unregister returns success after 4 KiB is consumed. The read later returns a changed source tail, proving access continues. |
+| Identical old v2 header after same-address registration | The old header is accepted and returns new registration bytes. |
+
+The SDK-owned check creates and closes an empty L1Manager each cycle. It
+does not resize an existing L1Manager. `/proc/self/maps` establishes mapping
+presence in this run, not RSS or a general allocator release guarantee.
+A remaining mapping blocks the next grant conservatively. The lending
+check retains its host-owned memfd throughout and changes exclusive region
+ownership instead. Neither result proves concurrent lifetime safety.
+
+Retained evidence is in [SDK handoff](tools/partitioning/results/2026-11-03-sdk-handoff.json),
+[drain-first](tools/partitioning/results/2026-11-03-tcp-safe.json),
+[accepted-read counterexample](tools/partitioning/results/2026-11-03-tcp-repro.json),
+and [stale-header counterexample](tools/partitioning/results/2026-11-03-stale-header.json).
+The final shared service cleanup was rerun with stale-header after those
+observations. Cleanup checks child exit statuses, escalates terminate to
+kill when needed, and attempts all cleanup even if one close fails.
+
+The next safe M3 mechanism is an opt-in TCP registration fence. Each
+accepted operation holds a region lease through terminal completion.
+Unregister seals admission, returns busy while leases remain, and allows
+reuse only after successful removal. A v3 header must carry the registration
+generation published in metadata; strict regions reject legacy headers and
+old generations. Local outgoing work needs the same lease, including work
+waiting in client queues. Store must retain backing on unregister errors,
+retry unmount idempotently, and suppress graceful cleanup callbacks until
+the transport drain succeeds. Disable Store's local memcpy bypass with
+`MC_STORE_MEMCPY=0` until it participates in that lifetime contract.
+
+A cooperative cluster barrier could avoid the wire change only if every
+client stops submissions, drains accepted and queued work, discards stale
+requests, and stays fenced through reuse. A missing client blocks progress.
+This is plausible for a closed harness but weaker as a reusable allocator
+contract. Registration generations also do not protect object-slot reuse
+within one still-registered segment. Object lifetime must remain tied to
+actual transfer completion rather than TTL or an API timeout.
