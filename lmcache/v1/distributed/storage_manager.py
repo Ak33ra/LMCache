@@ -366,9 +366,6 @@ class StorageManager:
 
         return result
 
-    @enable_tracing(
-        qualname="lmcache.v1.distributed.storage_manager.StorageManager.reserve_write"
-    )
     def reserve_write_operations(
         self, keys: list[ObjectKey], layout_desc: MemoryLayoutDesc
     ) -> dict[ObjectKey, L1WriteOperation]:
@@ -421,6 +418,11 @@ class StorageManager:
                         metadata={"during": "l1_store", "keys": pending},
                     )
                 )
+            if is_tracing_enabled() and not self.is_multi_l1 and operations:
+                publish_call_event(
+                    "lmcache.v1.distributed.storage_manager.StorageManager.reserve_write_operations",
+                    {"keys": list(operations), "layout_desc": layout_desc},
+                )
             completed = True
             return operations
         finally:
@@ -455,16 +457,11 @@ class StorageManager:
         discarded = frozenset(
             handle for key, handle in operations.items() if key not in written_keys
         )
-        if is_tracing_enabled() and not self.is_multi_l1:
-            for group in (
-                [k for k in operations if k in written_keys],
-                [k for k in operations if k not in written_keys],
-            ):
-                if group:
-                    publish_call_event(
-                        "lmcache.v1.distributed.storage_manager.StorageManager.finish_write",
-                        {"keys": group},
-                    )
+        if is_tracing_enabled() and not self.is_multi_l1 and operations:
+            publish_call_event(
+                "lmcache.v1.distributed.storage_manager.StorageManager.finish_write_operations",
+                {"keys": list(operations), "written_keys": list(written_keys)},
+            )
         for owner, handles in groups.items():
             self._l1_managers_by_id[owner].finish_write_operations(
                 handles, discard=discarded.intersection(handles), read_locks=0

@@ -145,6 +145,21 @@ do not need to be correlated across records because the public
 `StorageManager` API takes no handle as an input — later calls
 reference keys, not handles.
 
+### Operation-owned writes
+
+Single-L1 `reserve_write_operations` records successful keys and layout after
+reservation. `finish_write_operations` records the completed keys and the
+subset to publish before releasing the destinations. These manual events preserve exact write
+lifetimes and discard outcomes without writing process-local handles to disk.
+They are separate from the older entry-only write records, which remain
+supported.
+
+`ReplayContext` holds fresh handles by key. A smaller replay cache can reserve
+fewer keys; completion applies only to acquired handles. A larger replay cache
+does not reserve keys that failed in the source. EOF, truncated input, and
+interrupted dispatch discard unfinished destinations. This is storage-lifecycle
+replay, not payload capture. Multi-L1 operation replay remains unsupported.
+
 ### Context managers
 
 `StorageManager.read_prefetched_results` is a `@contextmanager`

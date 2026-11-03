@@ -214,13 +214,20 @@ They do not replace legacy GPU stream callbacks or SHM worker completion.
 See the [inline transfer contract](../multiprocess/engine_driven_transfer_design.md#inline-cpu-allocation-lifetimes)
 for the converted call sites and real-buffer verification.
 
-Single-L1 trace replay retains the existing call names and key/layout payloads.
-Operation-backed writes record `reserve_write` and `finish_write`; reads record
-`read_prefetched_results.__enter__`, `.__exit__`, and `finish_read_prefetched`.
-The release record follows the copy, preserving the replayed access interval.
-No operation capability or process-local manager ID is serialized. The existing
-multi-L1 replay limitation remains. `test_multi_l1.py` serializes these records
-and dispatches them against a fresh manager through the unchanged dispatcher.
+Single-L1 operation writes record `reserve_write_operations` after reservation
+and `finish_write_operations` before releasing the destinations. Reservation records contain only
+successful keys and layout; completion records contain keys and `written_keys`.
+Replay creates its own exact handles and discards unfinished destinations at
+EOF or interruption. This preserves both successful and discarded outcomes
+past the write TTL without serializing capabilities or process-local owner IDs.
+Legacy `reserve_write` / `finish_write` traces still replay unchanged. Multi-L1
+trace replay remains unsupported.
+
+Reads record `read_prefetched_results.__enter__`, `.__exit__`, and
+`finish_read_prefetched`. The release record follows the copy. These records
+preserve the access interval but still use the legacy replay read interface.
+`test_multi_l1.py` serializes portable records and dispatches them against a
+fresh manager.
 
 Inline serving converts one current prefetch TTL reservation to an exact read
 operation while holding the L1 lock. An absent or expired reservation cannot

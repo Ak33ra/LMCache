@@ -400,11 +400,12 @@ Portable trace replay also has a focused check using the existing dispatcher:
 ```bash
 /scratch/akira/lmcache-dev/bin/python -m pytest --confcutdir=tests/v1 \
   -o addopts='' -o log_cli=false -q \
-  tests/v1/distributed/test_multi_l1.py::test_inline_operations_replay_existing_call_schema
+  tests/v1/distributed/test_multi_l1.py::test_inline_operations_replay_portable_call_schema
 ```
 
-It checks all five legacy call names through argument serialization and replay
-against a fresh owner, with no leftover read locks or open replay contexts.
+It checks portable operation write records and legacy read records through
+serialization and replay against a fresh owner, with no leftover read locks
+or open replay contexts.
 This test uses the existing CPU allocation fixture and establishes replay
 compatibility, not native allocation lifetime evidence.
 
@@ -419,3 +420,23 @@ current prefetch reservation. The two native cases are
 before the correction and pass after atomic TTL-to-operation conversion.
 The combined inline, read-operation, Store-source, and multi-L1 selection
 passed 46 tests with no skips on 2026-11-03.
+
+Operation trace replay has separate timeout and cleanup checks:
+
+```bash
+CUDA_VISIBLE_DEVICES='' LMCACHE_TRACK_USAGE=false PYTHONPATH=. \
+  /scratch/akira/lmcache-dev/bin/python -m pytest --confcutdir=tests/v1 \
+  -o addopts='' -o log_cli=false -q tests/v1/distributed/test_multi_l1.py \
+  -k 'inline_write_outcome or operation_replay_tracks or portable_call_schema'
+CUDA_VISIBLE_DEVICES='' LMCACHE_TRACK_USAGE=false PYTHONPATH=. \
+  /scratch/akira/lmcache-dev/bin/python -m pytest --confcutdir=tests/cli \
+  -o addopts='' -o log_cli=false -q \
+  tests/cli/commands/trace/test_dispatch.py \
+  tests/cli/commands/trace/test_driver.py
+```
+
+Successful and discarded writes retain their outcomes after the one-second
+reservation timeout. Only source-side successful reservations enter the trace.
+EOF and interrupted dispatch must leave zero staging allocations. Source
+capabilities and owner IDs never enter the file. These CPU checks exercise
+storage bookkeeping and native TTL locks, not tensor payload replay.

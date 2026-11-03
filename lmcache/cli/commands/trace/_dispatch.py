@@ -24,6 +24,7 @@ from typing import Any, Callable
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.internal_api import L1WriteOperation
 from lmcache.v1.distributed.storage_manager import StorageManager
 
 logger = init_logger(__name__)
@@ -52,12 +53,43 @@ class ReplayContext:
             ``keys`` tuple.  A dict-of-deques keyed on
             ``tuple(keys)`` supports interleaved contexts across
             different key sets.
+        open_write_operations: Exact replay-side destinations owned until the
+            recorded completion or replay cleanup. Source handles are never
+            serialized.
     """
 
     sm: StorageManager
     open_read_contexts: dict[tuple[ObjectKey, ...], deque[AbstractContextManager]] = (
         field(default_factory=dict)
     )
+
+    open_write_operations: dict[ObjectKey, L1WriteOperation] = field(
+        default_factory=dict
+    )
+
+    def close(self) -> None:
+        """Discard unfinished replay writes and release dangling read contexts.
+
+        Safe after EOF, truncation, or interrupted dispatch. Replay does not
+        perform asynchronous copies into these write destinations.
+        """
+        for key_tuple, pending in list(self.open_read_contexts.items()):
+            while pending:
+                cm = pending.popleft()
+                try:
+                    cm.__exit__(None, None, None)
+                except Exception:
+                    logger.warning(
+                        "trace replay: forced exit of dangling read raised (keys=%d)",
+                        len(key_tuple),
+                        exc_info=True,
+                    )
+            self.open_read_contexts.pop(key_tuple, None)
+        if self.open_write_operations:
+            self.sm.finish_write_operations(
+                self.open_write_operations, written_keys=frozenset()
+            )
+            self.open_write_operations.clear()
 
 
 #: Type of a dispatcher handler: takes a :class:`ReplayContext` and an
@@ -161,6 +193,28 @@ def _call_sm_method(method_name: str) -> Handler:
     return _handler
 
 
+def _reserve_write_operations(ctx: ReplayContext, args: dict[str, Any]) -> None:
+    """Keep replay-side handles without serializing process-local identities."""
+    if any(key in ctx.open_write_operations for key in args["keys"]):
+        raise ValueError("Trace repeats an unfinished operation write")
+    ctx.open_write_operations.update(ctx.sm.reserve_write_operations(**args))
+
+
+def _finish_write_operations(ctx: ReplayContext, args: dict[str, Any]) -> None:
+    """Replay publication choices for destinations that fit the target cache."""
+    operations = {
+        key: ctx.open_write_operations[key]
+        for key in args["keys"]
+        if key in ctx.open_write_operations
+    }
+    ctx.sm.finish_write_operations(
+        operations,
+        written_keys=frozenset(args["written_keys"]).intersection(operations),
+    )
+    for key in operations:
+        del ctx.open_write_operations[key]
+
+
 def _enter_read_prefetched(ctx: ReplayContext, args: dict[str, Any]) -> None:
     """Handle a ``read_prefetched_results.__enter__`` record.
 
@@ -218,6 +272,8 @@ def build_default_dispatcher() -> CallDispatcher:
 
     * ``StorageManager.reserve_write``
     * ``StorageManager.finish_write``
+    * ``StorageManager.reserve_write_operations``
+    * ``StorageManager.finish_write_operations``
     * ``StorageManager.submit_prefetch_task``
     * ``StorageManager.finish_read_prefetched``
     * ``StorageManager.read_prefetched_results.__enter__``
@@ -238,6 +294,12 @@ def build_default_dispatcher() -> CallDispatcher:
             f"{_SM_PREFIX}.{method_name}",
             _call_sm_method(method_name),
         )
+    dispatcher.register(
+        f"{_SM_PREFIX}.reserve_write_operations", _reserve_write_operations
+    )
+    dispatcher.register(
+        f"{_SM_PREFIX}.finish_write_operations", _finish_write_operations
+    )
     dispatcher.register(
         f"{_SM_PREFIX}.read_prefetched_results.__enter__",
         _enter_read_prefetched,

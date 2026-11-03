@@ -227,6 +227,35 @@ class TestRecordReplayRoundtrip:
         assert all(not failed for _, failed in seen)
 
 
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_dangling_operation_trace_releases_replay_destinations(
+    trace_path: str, interrupt: bool
+) -> None:
+    """EOF and interrupted dispatch both discard owned replay destinations."""
+    keys = [_make_key(0)]
+
+    def script(sm: StorageManager) -> None:
+        operations = sm.reserve_write_operations(keys, _make_layout())
+        set_tracing_enabled(False)
+        sm.finish_write_operations(operations, written_keys=frozenset())
+
+    _record_sequence(trace_path, _make_sm_config(), script)
+
+    def on_record(qualname: str, latency_s: float, failed: bool) -> None:
+        if interrupt:
+            raise KeyboardInterrupt("interrupted replay")
+
+    with StorageReplayDriver(_make_sm_config(), trace_path) as driver:
+        if interrupt:
+            with pytest.raises(KeyboardInterrupt, match="interrupted replay"):
+                driver.run(on_record=on_record)
+        else:
+            result = driver.run()
+            assert result.records_replayed == 1
+            assert result.records_failed == result.records_skipped == 0
+        assert driver.storage_manager.get_l1_usage()[0] == 0
+
+
 class TestMismatchHandling:
     def test_unknown_qualname_is_skipped(self, trace_path):
         """An empty dispatcher with no matching handlers skips every
