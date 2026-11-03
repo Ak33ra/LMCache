@@ -765,6 +765,43 @@ class L1Manager(L1ManagerInterface):
         return results
 
     @l1_mgr_synchronized
+    def transfer_write_operations(
+        self, operations: dict[ObjectKey, L1WriteOperation]
+    ) -> dict[ObjectKey, L1WriteOperation]:
+        """Transfer an entire batch by replacing its active capabilities.
+
+        Args:
+            operations: Reserved keys mapped to their current original handles.
+                All local access must have ended before transfer.
+
+        Returns:
+            Replacement handles for the same keys and allocations. Only these
+            handles can subsequently transfer or complete the operations.
+            The input handles no longer authorize either action.
+
+        Raises:
+            ValueError: Any handle is foreign, copied, stale, repeated, or bound
+                to another key. The whole batch remains unchanged on rejection.
+        """
+        active: list[ActiveWriteOperation] = []
+        for key, handle in operations.items():
+            tracked = self._write_operations.get(handle.operation_id)
+            if tracked is None or tracked.handle is not handle:
+                raise ValueError("Write operation is not active on this manager")
+            if tracked.key != key:
+                raise ValueError("Write operation does not match its reserved key")
+            active.append(tracked)
+        replacements = {
+            entry.key: L1WriteOperation(
+                self._l1_manager_id, entry.handle.operation_id, entry.handle.memory_obj
+            )
+            for entry in active
+        }
+        for entry in active:
+            entry.handle = replacements[entry.key]
+        return replacements
+
+    @l1_mgr_synchronized
     def finish_write_operations(
         self,
         operations: list[L1WriteOperation],

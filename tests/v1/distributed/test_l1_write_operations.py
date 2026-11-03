@@ -160,3 +160,24 @@ def test_zero_read_lock_admission_and_negative_rejection(manager: L1Manager) -> 
     assert result[handle][0] == L1Error.SUCCESS
     assert manager.is_key_evictable(KEY)
     assert manager.delete([KEY])[KEY] == L1Error.SUCCESS
+
+
+def test_transfer_replaces_capability_without_releasing_allocation(
+    manager: L1Manager,
+) -> None:
+    """Only the recipient can complete or transfer an accepted destination."""
+    original = reserve(manager)
+    transferred = manager.transfer_write_operations({KEY: original})[KEY]
+    assert transferred is not original
+    assert transferred.memory_obj is original.memory_obj
+    assert manager.get_memory_usage()[0] == 4096
+    assert manager.report_status()["active_write_operation_count"] == 1
+    with pytest.raises(ValueError, match="not active"):
+        manager.transfer_write_operations({KEY: original})
+    with pytest.raises(ValueError, match="not active"):
+        manager.finish_write_operations([original])
+    final = manager.transfer_write_operations({KEY: transferred})[KEY]
+    with pytest.raises(ValueError, match="not active"):
+        manager.finish_write_operations([transferred])
+    manager.finish_write_operations([final], discard=frozenset([final]))
+    assert manager.get_memory_usage()[0] == 0

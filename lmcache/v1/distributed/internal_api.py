@@ -103,7 +103,8 @@ class L1WriteOperation:
         operation_id: Unique operation within that manager.
         memory_obj: Exact destination allocation, unreadable until admission.
 
-    Only the original handle can complete the operation. TTL expiry, timeout,
+    Only the current original handle can complete the operation. Transfer
+    replaces that handle and revokes the previous one. TTL expiry, timeout,
     and cancellation do not release it. Handles are process-local capabilities.
     """
 
@@ -401,6 +402,17 @@ class L1ManagerInterface(Protocol):
         tag: str = "",
     ) -> dict[ObjectKey, L1WriteOperationResult]:
         """Allocate pinned destinations with atomic per-key retention selection."""
+        ...
+
+    def transfer_write_operations(
+        self, operations: dict[ObjectKey, L1WriteOperation]
+    ) -> dict[ObjectKey, L1WriteOperation]:
+        """Validate all key/handle bindings and atomically replace capabilities.
+
+        Return replacement handles for the recipient, revoking the input
+        handles. Raise ValueError for any invalid binding without changing any
+        operation. The caller must stop accessing allocations before transfer.
+        """
         ...
 
     def finish_write_operations(

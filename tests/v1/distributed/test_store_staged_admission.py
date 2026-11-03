@@ -6,7 +6,7 @@ prove controller ownership, not native SDK or transport fencing.
 """
 
 # Standard
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import multiprocessing
 import threading
@@ -584,7 +584,9 @@ def test_accepted_capability_cannot_be_submitted_or_finished_twice() -> None:
     controller = make_controller(manager, adapter, DefaultStorePolicy())
     controller.start()
     operations = reserve(manager)
-    future = controller.submit_staged_write_operations(operations, adapter_id=ADAPTER_ID)
+    future = controller.submit_staged_write_operations(
+        operations, adapter_id=ADAPTER_ID
+    )
     adapter.wait_submitted()
     try:
         with pytest.raises(ValueError):
@@ -594,6 +596,39 @@ def test_accepted_capability_cannot_be_submitted_or_finished_twice() -> None:
         assert manager.get_memory_usage()[0] == 4096
         adapter.complete(1, L2StoreResult(True, 4096))
         assert future.result(timeout=5).admitted_keys == frozenset([KEY])
+        controller.stop(timeout=5)
+        assert adapter.accepted_count() == 1
+        assert manager.get_memory_usage()[0] == 0
+    finally:
+        adapter.close()
+        manager.close()
+
+
+def test_concurrent_handoffs_accept_exactly_one_owner() -> None:
+    """Competing callers cannot queue the same allocation twice."""
+    manager, adapter = make_manager(), ControlledStoreAdapter()
+    controller = make_controller(manager, adapter, DefaultStorePolicy())
+    controller.start()
+    operations = reserve(manager)
+    barrier = threading.Barrier(2)
+
+    def submit() -> Future[StoreAdmissionResult] | None:
+        barrier.wait(timeout=5)
+        try:
+            return controller.submit_staged_write_operations(
+                operations, adapter_id=ADAPTER_ID
+            )
+        except ValueError:
+            return None
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            pending = [workers.submit(submit) for _ in range(2)]
+            accepted = [result for task in pending if (result := task.result())]
+        assert len(accepted) == 1
+        adapter.wait_submitted()
+        adapter.complete(1, L2StoreResult(True, 4096))
+        assert accepted[0].result(timeout=5).admitted_keys == frozenset([KEY])
         controller.stop(timeout=5)
         assert adapter.accepted_count() == 1
         assert manager.get_memory_usage()[0] == 0
