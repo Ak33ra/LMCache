@@ -17,8 +17,11 @@ key-only deletion can target a replacement allocation.
 
 ## Shutdown and uncertain acceptance
 
-`stop(timeout=30.0)` rejects new work and discards queued notifications that
-have not been submitted. It keeps processing accepted tasks. If the deadline
+`stop(timeout=30.0)` rejects subsequent notifications and discards queued
+notifications. A submission already being dispatched may finish after stop
+begins; it remains tracked and must drain before shutdown succeeds. The
+controller also drops an undispatched batch if stop is observed after its
+allocation handles are acquired. If the deadline
 expires, it raises `TimeoutError` while the loop continues draining and the
 allocations stay pinned. The caller may retry `stop()` after completions
 arrive. L1 `close()` refuses to free active operations.

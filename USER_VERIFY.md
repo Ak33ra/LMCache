@@ -278,7 +278,7 @@ python -m pytest --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
   tests/v1/distributed/test_store_controller.py
 ```
 
-Expected result is **28 passed, zero skipped**. A controlled adapter pauses
+Expected result is **29 passed, zero skipped**. A controlled adapter pauses
 an actual read of a native CPU buffer past its TTL. Forced clear and a timed
 out shutdown must keep the source pinned. Releasing the reader lets a second
 shutdown complete, and the copied bytes must match the originals. The cases
@@ -286,7 +286,9 @@ cover retained stores, successful discard, and a failed terminal store.
 Another case accepts the buffer, then raises before returning the task ID.
 Its isolated child verifies that the source remains readable and cannot be
 reclaimed; status requires process exit because acceptance cannot be resolved.
-The adapter in these tests is controlled Python code.
+The adapter in these tests is controlled Python code. A further case starts
+shutdown during handle acquisition and verifies that the undispatched batch
+releases its handles without submitting to the adapter.
 
 Adding both M3 test files to U0a gives **321 passed, zero skipped**, recorded
 on 2026-11-03. Both U2 commands also passed against the real CPU native

@@ -155,6 +155,44 @@ def test_store_pins_until_completion_and_shutdown_drain(
         manager.close()
 
 
+def test_shutdown_during_acquisition_does_not_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch paused before dispatch releases its handles when stop is observed."""
+    manager = make_manager()
+    adapter = PausedStoreAdapter(L2StoreResult(True, 4096))
+    controller = make_controller(manager, adapter, DefaultStorePolicy())
+    acquired, resume = threading.Event(), threading.Event()
+    acquire = manager.acquire_read_operations
+
+    def paused_acquire(keys):
+        result = acquire(keys)
+        acquired.set()
+        assert resume.wait(5), "Acquisition was not released"
+        return result
+
+    monkeypatch.setattr(manager, "acquire_read_operations", paused_acquire)
+    controller.start()
+    stopped = False
+    try:
+        populate(manager)
+        assert acquired.wait(5)
+        with pytest.raises(TimeoutError):
+            controller.stop(timeout=0.01)
+        resume.set()
+        controller.stop(timeout=5)
+        stopped = True
+        assert not adapter.entered.is_set()
+        assert manager.report_status()["active_read_operation_count"] == 0
+        assert manager.delete([KEY])[KEY] == L1Error.SUCCESS
+    finally:
+        resume.set()
+        if not stopped:
+            controller.stop(timeout=5)
+        adapter.close()
+        manager.close()
+
+
 def _verify_uncertain_submission() -> None:
     """Run irrecoverable ownership ambiguity inside a disposable process."""
     manager = make_manager()

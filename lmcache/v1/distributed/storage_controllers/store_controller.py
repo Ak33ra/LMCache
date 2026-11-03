@@ -340,6 +340,8 @@ class StoreController(StorageControllerInterface):
 
         Note:
             Neither a shutdown request nor a timeout releases allocation handles.
+            A submission already being dispatched may finish after stop begins;
+            it remains tracked and must drain before shutdown can succeed.
             Adapter completion must mean local source-buffer access has ended;
             it does not prove remote transport or shared-segment quiescence.
         """
@@ -653,6 +655,15 @@ class StoreController(StorageControllerInterface):
                 continue
 
             read_results = l1_mgr.acquire_read_operations(target_keys)
+            if self._stop_flag.is_set():
+                l1_mgr.finish_read_operations(
+                    [
+                        operation
+                        for _, operation in read_results.values()
+                        if operation is not None
+                    ]
+                )
+                break
 
             successful_keys = []
             successful_objs = []
