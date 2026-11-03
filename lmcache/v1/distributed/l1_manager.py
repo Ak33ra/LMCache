@@ -37,6 +37,9 @@ from lmcache.v1.distributed.memory_manager import (
 from lmcache.v1.distributed.memory_manager.devdax_l1_memory_manager import (
     DevDaxL1MemoryManager,
 )
+from lmcache.v1.distributed.memory_manager.segmented_dram import (
+    SegmentedDRAML1MemoryManager,
+)
 from lmcache.v1.gpu_connector.gds_context import (
     close_l1_gds_context,
     initialize_l1_gds_context,
@@ -203,9 +206,29 @@ class L1Manager(L1ManagerInterface):
         weakref.WeakValueDictionary()
     )
 
-    def __init__(self, config: L1ManagerConfig):
-        self._config = config
+    def __init__(
+        self,
+        config: L1ManagerConfig,
+        *,
+        memory_manager: SegmentedDRAML1MemoryManager | None = None,
+    ) -> None:
+        """Construct L1, optionally owning an experimental segmented CPU pool.
+
+        Args:
+            config: L1 backend and object-lifetime configuration.
+            memory_manager: Unused segmented DRAM pool with capacity and
+                alignment matching config. Ownership transfers to this L1.
+                Reconfiguration requires caller-proven native quiescence.
+
+        Raises:
+            ValueError: If injected backing contradicts the configuration.
+        """
         self._l1_manager_id = next_l1_manager_id()
+        if memory_manager is not None:
+            if config.gds_l1_config is not None:
+                raise ValueError("segmented DRAM cannot back a GDS configuration")
+            memory_manager.attach_to_l1(config.memory_config, self._l1_manager_id)
+        self._config = config
         self._lock = threading.Lock()
 
         # Resident objects: readable, never write-locked.
@@ -219,7 +242,9 @@ class L1Manager(L1ManagerInterface):
         # GDS, Device-DAX, and CPU L1 are mutually exclusive tiers. Each tier
         # owns its backing allocator instead of branching inside the CPU path.
         self._memory_manager: L1ManagerProtocol
-        if config.gds_l1_config is not None:
+        if memory_manager is not None:
+            self._memory_manager = memory_manager
+        elif config.gds_l1_config is not None:
             if config.memory_config.devdax_path:
                 raise ValueError("GDS and Device-DAX require separate L1 managers")
             self._memory_manager = GDSL1MemoryManager(config.gds_l1_config)
@@ -1015,21 +1040,24 @@ class L1Manager(L1ManagerInterface):
     def get_capacity_bytes_by_backend(self) -> dict[L1BackendType, int]:
         """Return the current declared L1 capacity per backing medium.
 
-        CPU and GDS retain their boot-configured capacity. For Device-DAX,
-        only active arenas count as usable capacity; draining arenas stop
-        accepting allocations and are excluded immediately.
+        Ordinary CPU and GDS retain their boot-configured capacity. For
+        Device-DAX and injected segmented DRAM, only active regions count
+        as usable capacity; draining regions are excluded immediately.
 
         Returns:
             A fresh mapping from backing-medium type to usable capacity in
             bytes, with zero-sized media omitted.
 
         Note:
-            Device-DAX arena state is snapshotted under the allocator's pool
-            lock. A separate usage query may observe an adjacent topology if
-            reconfiguration is concurrent.
+            Runtime arena and segment state is snapshotted under the backing
+            manager's pool lock. A separate usage query may observe an adjacent
+            topology if reconfiguration is concurrent.
         """
         capacities = self._boot_capacity_bytes_by_backend.copy()
         manager = self._memory_manager
+        if isinstance(manager, SegmentedDRAML1MemoryManager):
+            active_bytes = manager.get_active_capacity()
+            return {L1BackendType.DRAM: active_bytes} if active_bytes else {}
         if isinstance(manager, DevDaxL1MemoryManager):
             active_bytes = sum(
                 status.size_in_bytes
@@ -1121,10 +1149,11 @@ class L1Manager(L1ManagerInterface):
 
         Returns:
             For Device-DAX, the optional DRAM region plus all mapped arenas,
-            including draining arenas. For other memory managers, 1.
+            including draining arenas. For segmented DRAM, all still-mapped
+            segments. For other memory managers, 1.
         """
         manager = self._memory_manager
-        if isinstance(manager, DevDaxL1MemoryManager):
+        if isinstance(manager, (DevDaxL1MemoryManager, SegmentedDRAML1MemoryManager)):
             return manager.memory_region_count()
         return 1
 

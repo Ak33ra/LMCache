@@ -175,3 +175,58 @@ this example has no outstanding native operation. A raw native pointer can
 outlive both the L1 TTL and its Python tensor, so this check does not establish
 transfer-completion safety. Shared Store handoff, two-host operation, GPU,
 RDMA, page residency, and a total private/shared budget remain outside U2a.
+
+## U2b. Resize backing under the same L1 manager
+
+Run this unit after U2a:
+
+```bash
+python -m pytest --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
+  tests/v1/distributed/test_segmented_dram_l1.py
+```
+
+Expected result: **9 passed, zero skipped**. Recorded on 2026-11-03 in the
+U2a environment. The test constructs one `L1Manager` with a one-page segment,
+fills it, adds two pages, and fills both new pages. It drains and removes the
+original segment, verifies the surviving keys, adds another page, then removes
+the two-page segment and verifies the new key. `/proc/self/maps` confirms each
+removal. A second test grows an empty L1 to one page and returns it to zero.
+
+The backend is injected through `L1Manager(config, memory_manager=pool)`.
+Initial size and alignment must match, SHM must be disabled in the L1 config,
+and the pool must have no live objects or drains. Tests reject conflicting
+configuration, GDS, and a second L1 owner. `get_l1_memory_desc()` returns `None`
+even when only one segment remains, because a removable segment cannot provide
+a fixed registration lifetime. No MP CLI enables this backend.
+
+Check unchanged L1 and Device-DAX behavior with:
+
+```bash
+python -m pytest --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
+  tests/v1/distributed/test_l1_manager.py \
+  tests/v1/distributed/test_devdax_l1_allocator.py
+```
+
+Recorded result: **168 passed, zero skipped**. These existing DAX tests are
+regression checks; U2a and U2b provide the DRAM evidence. U2b runs within one
+process using real L1 objects and native TTL locks. The caller is quiescent.
+It does not establish MP service resize, transfer-completion fencing, or the
+physical private/shared handoff with Mooncake Store.
+
+Focused Ruff, isort, mypy, codespell, SPDX, and device-boundary checks passed.
+The manual U2a interpreter example also passed. A strict full documentation
+build was attempted with an isolated docs environment:
+
+```bash
+PYTHONPATH="$PWD" \
+  /scratch/akira/kvc-worktrees/dram-segments-docs-env/bin/sphinx-build \
+  -W --keep-going -b html docs/source .audit/sphinx-html
+```
+
+The build reports 26 existing diagnostics in unchanged `docs/source` pages,
+including duplicate CLI and operator labels, short legacy title underlines,
+and a malformed `code-block` at
+`docs/source/legacy/production/observability/chunk_statistics.rst:291`.
+The strict docs gate therefore remains failed. The local log is
+`.audit/sphinx-build.log`. The U2 changes add Markdown design and verification
+documents and do not modify any `docs/source` file.
