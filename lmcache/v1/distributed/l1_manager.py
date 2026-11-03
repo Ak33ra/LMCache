@@ -24,6 +24,9 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.distributed.config import L1ManagerConfig, get_configured_capacity_bytes
 from lmcache.v1.distributed.error import L1Error, L1ReconfigureError
 from lmcache.v1.distributed.internal_api import (
+    L1AdmissionLimits,
+    L1AdmissionState,
+    L1AdmissionUsage,
     L1ManagerInterface,
     L1ManagerListener,
     L1ObjectMeta,
@@ -32,6 +35,7 @@ from lmcache.v1.distributed.internal_api import (
     L1ReadOperationResult,
     L1WriteOperation,
     L1WriteOperationResult,
+    L1WriteRetention,
 )
 from lmcache.v1.distributed.memory_manager import (
     GDSL1MemoryManager,
@@ -116,14 +120,19 @@ class L1ObjectState:
     read_lock: TTLLock
     """ The read lock with TTL for the object. """
 
-    is_temporary: bool
-    """ Whether the object is temporary (need to be deleted after read). """
+    retention: L1WriteRetention
+    """Selected RETAIN or TEMPORARY lifetime; never PREFER_RETAIN."""
 
     write_operation: bool = False
     """An explicit writer owns this staging allocation regardless of TTL."""
 
     read_operations: int = 0
     """Explicit readers whose lifetime does not expire with a reservation TTL."""
+
+    @property
+    def is_temporary(self) -> bool:
+        """Whether the allocation should be freed after its readers finish."""
+        return self.retention is L1WriteRetention.TEMPORARY
 
 
 @dataclass
@@ -225,7 +234,8 @@ class L1Manager(L1ManagerInterface):
             v                          (...)  (...)
           (freed)                  (Higher Counts)
 
-    For every operation on list of keys, the operation is atomic
+    Each operation on a list of keys holds one manager lock. Bounded write
+    admission may refuse individual keys in deterministic input order.
     """
 
     # OTel registers each gauge once; its callback snapshots all live managers.
@@ -240,6 +250,7 @@ class L1Manager(L1ManagerInterface):
         config: L1ManagerConfig,
         *,
         memory_manager: SegmentedDRAML1MemoryManager | None = None,
+        admission_limits: L1AdmissionLimits | None = None,
     ) -> None:
         """Construct L1, optionally owning an experimental segmented CPU pool.
 
@@ -248,6 +259,8 @@ class L1Manager(L1ManagerInterface):
             memory_manager: Unused segmented DRAM pool with capacity and
                 alignment matching config. Ownership transfers to this L1.
                 Reconfiguration requires caller-proven native quiescence.
+            admission_limits: Optional retained/temporary allocation quotas.
+                Limits include aligned staging bytes and pinned discards.
 
         Raises:
             ValueError: If injected backing contradicts the configuration.
@@ -258,6 +271,8 @@ class L1Manager(L1ManagerInterface):
                 raise ValueError("segmented DRAM cannot back a GDS configuration")
         self._config = config
         self._lock = threading.Lock()
+        self._admission_limits = admission_limits
+        self._admission_state = L1AdmissionState.OPEN
 
         # Resident objects: readable, never write-locked.
         self._objects: dict[ObjectKey, L1ObjectState] = {}
@@ -380,7 +395,10 @@ class L1Manager(L1ManagerInterface):
         Note:
             Staging objects are never readable; a key that is only
             being written is reported as ``KEY_NOT_EXIST``.
+            QUIESCING refuses new readers with ``KEY_NOT_READABLE``.
         """
+        if self._admission_state is L1AdmissionState.QUIESCING:
+            return {key: (L1Error.KEY_NOT_READABLE, None) for key in keys}
         total = validate_read_locks(read_locks)
         ret: dict[ObjectKey, L1OperationResult] = {}
         successful_keys: list[ObjectKey] = []
@@ -416,8 +434,11 @@ class L1Manager(L1ManagerInterface):
             Per-key SUCCESS and a handle, KEY_NOT_EXIST for a missing key, or
             KEY_IS_LOCKED at the per-allocation limit of 128 active operations.
             KEY_NOT_READABLE if the required TTL reservation is absent/expired.
+            QUIESCING also returns KEY_NOT_READABLE without consuming a lock.
             The caller must release each handle after all buffer access ends.
         """
+        if self._admission_state is L1AdmissionState.QUIESCING:
+            return {key: (L1Error.KEY_NOT_READABLE, None) for key in keys}
         results: dict[ObjectKey, L1ReadOperationResult] = {}
         acquired: list[ObjectKey] = []
         for key in dict.fromkeys(keys):
@@ -664,10 +685,11 @@ class L1Manager(L1ManagerInterface):
 
         Raises:
             ValueError: If ``keys`` and ``is_temporary`` differ in length.
+            RuntimeError: Bounded admission requires explicit write operations.
 
         Errors:
             KEY_NOT_WRITABLE: The key already has a resident object, or
-                ``tag`` already stages the key.
+                ``tag`` already stages the key, or admission is quiescing.
             OUT_OF_MEMORY: Not enough memory to allocate for the object.
 
         Note:
@@ -675,29 +697,58 @@ class L1Manager(L1ManagerInterface):
             it is admitted. Different tags may stage the same key at the same
             time.
         """
+        if self._admission_limits is not None:
+            raise RuntimeError("Bounded admission requires reserve_write_operations")
+        if self._admission_state is L1AdmissionState.QUIESCING:
+            return {key: (L1Error.KEY_NOT_WRITABLE, None) for key in keys}
         return self._reserve_write(keys, is_temporary, layout_desc, tag)
 
     @l1_mgr_synchronized
     def reserve_write_operations(
         self,
         keys: list[ObjectKey],
-        is_temporary: list[bool],
+        retention: list[L1WriteRetention],
         layout_desc: MemoryLayoutDesc,
         tag: str = "",
     ) -> dict[ObjectKey, L1WriteOperationResult]:
         """Allocate and pin unpublished destinations in one critical section.
 
-        Arguments and allocation errors follow :meth:`reserve_write`. Each
-        successful result contains an immutable allocation-bound handle. Only
-        :meth:`finish_write_operations` can release that allocation, after all
-        local writer access has ended. Duplicate keys are rejected.
+        Args:
+            keys: Distinct object keys to reserve, in admission order.
+            retention: One intent per key. PREFER_RETAIN takes retained quota
+                first, then temporary quota. Without limits it means RETAIN.
+            layout_desc: Tensor layout shared by the destinations.
+            tag: Writer identity, independent from other staging writers.
+
+        Returns:
+            Per-key SUCCESS and an allocation-bound handle, OUT_OF_MEMORY when
+            quota or physical slots are exhausted, or KEY_NOT_WRITABLE when
+            the key/tag is occupied or admission is QUIESCING. Bounded mode
+            admits independently in input order. Unbounded mode retains its
+            whole-batch physical allocation contract. Returned memory objects
+            are borrowed; only finish_write_operations releases ownership.
 
         Raises:
-            ValueError: Keys repeat or temporary flags differ in length.
+            ValueError: Keys repeat or retention intents differ in length.
+            TypeError: A retention intent is not L1WriteRetention.
         """
         if len(set(keys)) != len(keys):
             raise ValueError("Repeated keys in write operation reservation")
-        reserved = self._reserve_write(keys, is_temporary, layout_desc, tag)
+        if len(keys) != len(retention):
+            raise ValueError("Keys and retention intents differ in length")
+        if any(not isinstance(intent, L1WriteRetention) for intent in retention):
+            raise TypeError("Retention intents must be L1WriteRetention")
+        if self._admission_state is L1AdmissionState.QUIESCING:
+            return {key: (L1Error.KEY_NOT_WRITABLE, None) for key in keys}
+        if self._admission_limits is None:
+            reserved = self._reserve_write(
+                keys,
+                [intent is L1WriteRetention.TEMPORARY for intent in retention],
+                layout_desc,
+                tag,
+            )
+        else:
+            reserved = self._reserve_bounded_write(keys, retention, layout_desc, tag)
         results: dict[ObjectKey, L1WriteOperationResult] = {}
         for key, (error, obj) in reserved.items():
             if obj is None:
@@ -1160,18 +1211,26 @@ class L1Manager(L1ManagerInterface):
 
         Returns:
             True if the key exists and no resident or staging allocation
-            has a live lock or operation; False otherwise.
+            has a live lock or operation; False otherwise. Bounded admission
+            additionally excludes keys holding only temporary allocations.
         """
         entry = self._objects.get(key, None)
+        if self._admission_limits is not None and entry is not None:
+            if entry.is_temporary:
+                return False
         if entry is not None and (entry.read_operations or entry.read_lock.is_locked()):
             return False
         per_tag = self._staging.get(key, None)
         if per_tag is None:
             return entry is not None
         # Snapshot: this runs without the manager lock.
+        staged_objects = list(per_tag.values())
+        if self._admission_limits is not None and entry is None:
+            if all(staged.is_temporary for staged in staged_objects):
+                return False
         return all(
             not staged.write_operation and not staged.write_lock.is_locked()
-            for staged in list(per_tag.values())
+            for staged in staged_objects
         )
 
     def get_memory_usage(self) -> tuple[int, int]:
@@ -1185,6 +1244,89 @@ class L1Manager(L1ManagerInterface):
             via "L1ManagerListener" to notify the memory usage changes.
         """
         return self._memory_manager.get_memory_usage()
+
+    @l1_mgr_synchronized
+    def set_admission_limits(self, limits: L1AdmissionLimits) -> None:
+        """Set quotas without moving or freeing any existing allocations.
+
+        Args:
+            limits: New aligned-allocation quotas. Lowering a quota below
+                usage refuses further admission in that class until it drains.
+
+        Raises:
+            ValueError: First activation requires an empty L1, so no legacy
+                writer or borrowed reference can bypass bounded ownership.
+        """
+        if self._admission_limits is None and (self._objects or self._staging):
+            raise ValueError("First admission-limit activation requires an empty L1")
+        self._admission_limits = limits
+
+    @l1_mgr_synchronized
+    def get_admission_limits(self) -> L1AdmissionLimits | None:
+        """Return configured quotas, or None when bounded admission is disabled."""
+        return self._admission_limits
+
+    @l1_mgr_synchronized
+    def set_admission_state(self, state: L1AdmissionState) -> None:
+        """Pause or resume acquisition of new read/write ownership.
+
+        Args:
+            state: QUIESCING refuses new reservations and read operations.
+                All completion, discard and deletion paths remain available.
+                Existing writes may complete and take their serving read locks.
+        """
+        self._admission_state = state
+
+    @l1_mgr_synchronized
+    def get_admission_state(self) -> L1AdmissionState:
+        """Return the current read/write admission state."""
+        return self._admission_state
+
+    @l1_mgr_synchronized
+    def get_admission_usage(self) -> L1AdmissionUsage:
+        """Snapshot aligned owned allocation bytes and optional class limits.
+
+        Includes residents, all staging tags, and pinned deferred discards.
+        Bytes are derived from ownership tables, never a separate charge ledger.
+        """
+        return self._admission_usage()
+
+    @l1_mgr_synchronized
+    def get_eviction_pressure(self) -> tuple[int, int]:
+        """Return retained used/limit when bounded, otherwise physical used/total."""
+        if self._admission_limits is None:
+            return self._memory_manager.get_memory_usage()
+        return (
+            self._admission_usage().retained_allocated_bytes,
+            self._admission_limits.retained_bytes,
+        )
+
+    @l1_mgr_synchronized
+    def reclaim_temporary_objects(self) -> int:
+        """Free bounded temporary residents abandoned after serving TTL expiry.
+
+        Returns:
+            Number of allocations freed. Disabled mode performs no work.
+
+        Exact read/write operations never expire. They prevent this sweep from
+        releasing their allocations even when every serving TTL has expired.
+        """
+        if self._admission_limits is None:
+            return 0
+        keys: list[ObjectKey] = []
+        objects: list[MemoryObj] = []
+        for key, entry in list(self._objects.items()):
+            if (
+                entry.is_temporary
+                and not entry.read_operations
+                and not entry.read_lock.is_locked()
+            ):
+                del self._objects[key]
+                keys.append(key)
+                objects.append(entry.memory_obj)
+        if keys:
+            self._free_and_report_deleted(keys, objects)
+        return len(keys)
 
     @l1_mgr_synchronized
     def get_staging_memory_usage(self) -> int:
@@ -1548,7 +1690,9 @@ class L1Manager(L1ManagerInterface):
                     tag,
                 )
                 staged.write_lock.lock()
-                staged.is_temporary = is_temp
+                staged.retention = (
+                    L1WriteRetention.TEMPORARY if is_temp else L1WriteRetention.RETAIN
+                )
                 ret[key] = (L1Error.SUCCESS, staged.memory_obj)
                 successful_keys.append(key)
                 continue
@@ -1580,7 +1724,11 @@ class L1Manager(L1ManagerInterface):
                     memory_obj=mem_obj,
                     write_lock=TTLLock(self._write_ttl_seconds),
                     read_lock=TTLLock(self._read_ttl_seconds),
-                    is_temporary=is_temp,
+                    retention=(
+                        L1WriteRetention.TEMPORARY
+                        if is_temp
+                        else L1WriteRetention.RETAIN
+                    ),
                 )
                 entry.write_lock.lock()
                 self._put_staging(key, tag, entry)
@@ -1600,6 +1748,101 @@ class L1Manager(L1ManagerInterface):
             )
         )
         return ret
+
+    def _admission_usage(self) -> L1AdmissionUsage:
+        """Derive physical charges while holding the manager lock."""
+        retained = 0
+        temporary = 0
+        entries = list(self._objects.values())
+        entries.extend(
+            entry for per_tag in self._staging.values() for entry in per_tag.values()
+        )
+        for entry in entries:
+            if entry.is_temporary:
+                temporary += entry.memory_obj.get_physical_size()
+            else:
+                retained += entry.memory_obj.get_physical_size()
+        limits = self._admission_limits
+        return L1AdmissionUsage(
+            retained,
+            temporary,
+            limits.retained_bytes if limits is not None else None,
+            limits.temporary_bytes if limits is not None else None,
+        )
+
+    def _reserve_bounded_write(
+        self,
+        keys: list[ObjectKey],
+        retention: list[L1WriteRetention],
+        layout_desc: MemoryLayoutDesc,
+        tag: str,
+    ) -> dict[ObjectKey, L1OperationResult]:
+        """Select final retention and reserve physical slots under the L1 lock."""
+        limits = self._admission_limits
+        assert limits is not None
+        usage = self._admission_usage()
+        retained = usage.retained_allocated_bytes
+        temporary = usage.temporary_allocated_bytes
+        results: dict[ObjectKey, L1OperationResult] = {}
+        admitted: list[ObjectKey] = []
+        completed = False
+        try:
+            for key, intent in zip(keys, retention, strict=True):
+                if key in self._objects or self._get_staging(key, tag) is not None:
+                    results[key] = (L1Error.KEY_NOT_WRITABLE, None)
+                    continue
+                error, objects = self._memory_manager.allocate(layout_desc, 1)
+                if error is not L1Error.SUCCESS:
+                    self._memory_manager.free(objects)
+                    results[key] = (L1Error.OUT_OF_MEMORY, None)
+                    continue
+                obj = objects[0]
+                size = obj.get_physical_size()
+                if (
+                    intent is not L1WriteRetention.TEMPORARY
+                    and retained + size <= limits.retained_bytes
+                ):
+                    selected = L1WriteRetention.RETAIN
+                    retained += size
+                elif (
+                    intent is not L1WriteRetention.RETAIN
+                    and temporary + size <= limits.temporary_bytes
+                ):
+                    selected = L1WriteRetention.TEMPORARY
+                    temporary += size
+                else:
+                    self._memory_manager.free(objects)
+                    results[key] = (L1Error.OUT_OF_MEMORY, None)
+                    continue
+                obj.set_l1_manager(self._l1_manager_id)
+                # Borrowed reference-count cleanup cannot release manager ownership.
+                # All manager free paths explicitly invalidate the allocation.
+                obj.pin()
+                entry = L1ObjectState(
+                    obj,
+                    TTLLock(self._write_ttl_seconds),
+                    TTLLock(self._read_ttl_seconds),
+                    selected,
+                )
+                entry.write_lock.lock()
+                self._put_staging(key, tag, entry)
+                admitted.append(key)
+                results[key] = (L1Error.SUCCESS, obj)
+            completed = True
+        finally:
+            if not completed:
+                self._memory_manager.free(
+                    [self._pop_staging(key, tag).memory_obj for key in admitted]
+                )
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_reserved_write(admitted)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_WRITE_RESERVED,
+                metadata={"l1_tag": self._config.tag, "keys": admitted, "tag": tag},
+            )
+        )
+        return results
 
     def _take_staging(
         self,

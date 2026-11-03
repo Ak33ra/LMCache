@@ -38,6 +38,7 @@ from lmcache.v1.distributed.internal_api import (
     L1OperationResult,
     L1ReadOperation,
     L1WriteOperation,
+    L1WriteRetention,
     L2AdapterListener,
 )
 from lmcache.v1.distributed.l1_manager import L1Manager
@@ -394,7 +395,10 @@ class StorageManager:
                 if not pending:
                     break
                 results = manager.reserve_write_operations(
-                    pending, [False] * len(pending), layout_desc, tag=_L1_WRITE_TAG
+                    pending,
+                    [L1WriteRetention.RETAIN] * len(pending),
+                    layout_desc,
+                    tag=_L1_WRITE_TAG,
                 )
                 operations.update(
                     (key, handle)

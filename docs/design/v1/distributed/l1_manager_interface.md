@@ -26,6 +26,10 @@ without changes on the caller side.
   adapters end local buffer access. Successful completion atomically admits
   serving reads; failed completion discards the exact destination. See
   [write ownership](l1_manager.md#explicit-destination-write-operations).
+- Bounded allocation uses `L1WriteRetention`, `L1AdmissionLimits`,
+  `L1AdmissionUsage`, and `L1AdmissionState`. Managers expose quota/state
+  setters and snapshots, retained eviction pressure, and temporary cleanup.
+  See [the admission contract](l1-admission.md).
 - It is `runtime_checkable`; `L1Manager` declares it explicitly
   (`class L1Manager(L1ManagerInterface)`) so the contract is visible at the
   implementation site, not only at the call sites.

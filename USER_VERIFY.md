@@ -440,3 +440,70 @@ reservation timeout. Only source-side successful reservations enter the trace.
 EOF and interrupted dispatch must leave zero staging allocations. Source
 capabilities and owner IDs never enter the file. These CPU checks exercise
 storage bookkeeping and native TTL locks, not tensor payload replay.
+
+## U4a. Bounded retained and temporary L1 admission
+
+Run from this checkout using the environment at the top of this file. The
+admission tests use real segmented CPU mappings of at most 64 KiB per manager
+and native TTL locks. They do not require Mooncake or a GPU.
+
+```bash
+python -m pytest --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
+  tests/v1/distributed/test_l1_admission.py \
+  tests/v1/distributed/test_l1_write_operations.py \
+  tests/v1/distributed/test_l1_read_operations.py \
+  tests/v1/distributed/test_l1_interface.py
+```
+
+Expected result is **30 passed, zero skipped**. The 16 new admission cases
+cover 4 KiB alignment, bounded fallback, zero private quota, concurrent quota
+selection, both same-key winner classes, abort and deferred free, borrowed
+reference-count cleanup, quiescing, reduced quotas, retained LRU pressure, and
+temporary cleanup with zero private quota. One case injects a later allocator
+exception after allocating a real first buffer. The four existing interface
+tests use their existing allocation fixture; they are contract regressions,
+not additional native allocator evidence.
+
+The caller regression selection is:
+
+```bash
+python -m pytest --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q -ra \
+  tests/v1/distributed/test_l1_manager.py \
+  tests/v1/distributed/test_prefetch_controller.py \
+  tests/v1/distributed/test_prefetch_write_operations.py \
+  tests/v1/distributed/test_multi_l1.py \
+  tests/v1/distributed/test_eviction_extra_logging.py \
+  tests/v1/multiprocess/test_inline_operation_lifetimes.py \
+  tests/v1/multiprocess/test_engine_driven_multigroup.py
+```
+
+Recorded on 2026-11-03 with Python 3.12.13, torch 2.15.0+cu132, pytest 9.2.0,
+CPU platform, and a compiled `lmcache_native` extension. The caller selection
+passed **234 tests** and skipped the existing CUDA SHM multigroup roundtrip
+because CUDA was unavailable. Prefetch tests use mock L2 adapters. No live
+shared-store admission, MP activation, GPU, or physical-resize claim is made.
+Logs are `/tmp/kvc-admission-focused-final.log` and
+`/tmp/kvc-admission-regressions.log`.
+
+Changed Python files pass Ruff 0.11.7, formatting, isort 6.0.1, SPDX, and the
+direct-device checker. Production changes and the new test module pass mypy
+1.17.1. Checking both migrated legacy test modules additionally reports seven
+existing annotation/narrowing errors in untouched lines; see
+`/tmp/kvc-admission-mypy.log`. Codespell 2.4.1 passes the changed content.
+
+The full documentation check is reproducible without modifying the prepared
+Python environment:
+
+```bash
+uvx --from sphinx --with-requirements requirements/docs.txt \
+  sphinx-build -b html -W --keep-going docs/source /tmp/kvc-admission-docs
+```
+
+This check remains blocked by 26 diagnostics in existing CLI, legacy, and
+operator pages, including a malformed legacy `code-block` directive. All 26
+also occur when building the base revision `3744a7e0` documentation. There are
+no diagnostics for the new admission page. The build logs are
+`/tmp/kvc-admission-docs.log` and `/tmp/kvc-admission-docs-baseline.log`.
+
+The implementation contract is in
+[the mirrored admission design](docs/design/v1/distributed/l1-admission.md).
