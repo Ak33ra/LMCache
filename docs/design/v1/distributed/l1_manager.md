@@ -131,7 +131,7 @@ failed close, handle admission, batch validation, and discard across key reuse.
 
 ## Explicit destination write operations
 
-`reserve_write_operations(keys, is_temporary, layout_desc, tag)` allocates
+`reserve_write_operations(keys, retention, layout_desc, tag)` allocates
 unpublished destinations and returns original `L1WriteOperation` capabilities.
 Their registry entries bind exact staging allocations. TTL expiry never permits
 reuse, admission by a legacy finish call, or reclamation through eviction,
@@ -159,3 +159,7 @@ It adds no TTL reader and emits the normal write-finished event and listener
 callback for non-temporary newly admitted objects. Positive counts retain the
 prefetch completion behavior; negative counts fail before changing ownership.
 Temporary zero-lock admissions remain excluded from Store notifications.
+
+`retention` contains `L1WriteRetention` intents. Optional bounded admission
+selects retained or temporary ownership under the same allocation lock. See
+[the admission contract](l1-admission.md) for quotas, quiescing, and cleanup.

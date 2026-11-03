@@ -24,6 +24,7 @@ from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import (
     L1ManagerListener,
     L1WriteOperationResult,
+    L1WriteRetention,
 )
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.storage_manager import StorageManager
@@ -216,11 +217,11 @@ def test_overflow_allocation_failure_discards_earlier_handles(
 
     def partial(
         keys: list[ObjectKey],
-        temporary: list[bool],
+        retention: list[L1WriteRetention],
         layout: MemoryLayoutDesc,
         tag: str = "",
     ) -> dict[ObjectKey, L1WriteOperationResult]:
-        result = reserve(keys[:1], temporary[:1], layout, tag)
+        result = reserve(keys[:1], retention[:1], layout, tag)
         result.update({key: (L1Error.OUT_OF_MEMORY, None) for key in keys[1:]})
         return result
 

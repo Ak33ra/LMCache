@@ -41,7 +41,11 @@ from lmcache.v1.distributed.bitmap_ops.fold import (
     fold_unfold_grouped,
 )
 from lmcache.v1.distributed.error import L1Error
-from lmcache.v1.distributed.internal_api import L1ManagerInterface, L1WriteOperation
+from lmcache.v1.distributed.internal_api import (
+    L1ManagerInterface,
+    L1WriteOperation,
+    L1WriteRetention,
+)
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
@@ -269,7 +273,10 @@ def _reserve_l1_cells(
         keys = row.gather(group.keys)
         results = l1_manager.reserve_write_operations(
             keys=keys,
-            is_temporary=[not retain[key] for key in keys],
+            retention=[
+                L1WriteRetention.RETAIN if retain[key] else L1WriteRetention.TEMPORARY
+                for key in keys
+            ],
             layout_desc=group.layout_desc,
             tag=tag,
         )

@@ -30,6 +30,48 @@ if TYPE_CHECKING:
 L1OperationResult = tuple[L1Error, "MemoryObj | None"]
 
 
+class L1WriteRetention(enum.Enum):
+    """Requested lifetime of a destination, selected atomically at allocation."""
+
+    RETAIN = "retain"
+    TEMPORARY = "temporary"
+    PREFER_RETAIN = "prefer_retain"
+
+
+@dataclass(frozen=True)
+class L1AdmissionLimits:
+    """Aligned allocation limits, including resident and staging objects."""
+
+    retained_bytes: int
+    temporary_bytes: int
+
+    def __post_init__(self) -> None:
+        """Reject negative quotas before they can change admission."""
+        if self.retained_bytes < 0 or self.temporary_bytes < 0:
+            raise ValueError("L1 admission limits must be nonnegative")
+
+
+@dataclass(frozen=True)
+class L1AdmissionUsage:
+    """Owned physical allocation bytes; absent limits mean unbounded admission.
+
+    Allocated bytes include unpublished writers and discarded objects still
+    held by readers. They are subsets of mapped backing, not extra charges.
+    """
+
+    retained_allocated_bytes: int
+    temporary_allocated_bytes: int
+    retained_limit_bytes: int | None
+    temporary_limit_bytes: int | None
+
+
+class L1AdmissionState(enum.Enum):
+    """Whether new read/write ownership may enter the manager."""
+
+    OPEN = "open"
+    QUIESCING = "quiescing"
+
+
 @dataclass(frozen=True, eq=False)
 class L1ReadOperation:
     """Process-local capability pinning one allocation until explicit completion.
@@ -354,11 +396,11 @@ class L1ManagerInterface(Protocol):
     def reserve_write_operations(
         self,
         keys: list[ObjectKey],
-        is_temporary: list[bool],
+        retention: list[L1WriteRetention],
         layout_desc: MemoryLayoutDesc,
         tag: str = "",
     ) -> dict[ObjectKey, L1WriteOperationResult]:
-        """Allocate unpublished destinations pinned until explicit completion."""
+        """Allocate pinned destinations with atomic per-key retention selection."""
         ...
 
     def finish_write_operations(
@@ -419,6 +461,34 @@ class L1ManagerInterface(Protocol):
 
     def get_memory_usage(self) -> tuple[int, int]:
         """Return ``(used_bytes, total_bytes)``."""
+        ...
+
+    def set_admission_limits(self, limits: L1AdmissionLimits) -> None:
+        """Set bounded quotas without reclassifying or freeing live allocations."""
+        ...
+
+    def get_admission_limits(self) -> L1AdmissionLimits | None:
+        """Return bounded quotas, or None when bounded admission is disabled."""
+        ...
+
+    def set_admission_state(self, state: L1AdmissionState) -> None:
+        """Pause or resume new readers/writers; held operations may complete."""
+        ...
+
+    def get_admission_state(self) -> L1AdmissionState:
+        """Return whether new read/write ownership is accepted."""
+        ...
+
+    def get_admission_usage(self) -> L1AdmissionUsage:
+        """Return aligned retained/temporary bytes from owned allocations."""
+        ...
+
+    def get_eviction_pressure(self) -> tuple[int, int]:
+        """Return retained used/limit when bounded, otherwise physical used/total."""
+        ...
+
+    def reclaim_temporary_objects(self) -> int:
+        """Free abandoned temporary objects without active readers or writers."""
         ...
 
     def get_staging_memory_usage(self) -> int:
