@@ -66,7 +66,8 @@ This makes a surviving Python tensor view block `mmap.close()`. A direct
 the invalidated `MemoryObj`'s view, while an independently held view still
 keeps the mapping charged. Retrying removal after the view is dropped can
 release the mapping. This Python protection cannot see a native pointer held
-without its Python tensor.
+without its Python tensor. It also does not retain the freed object's slot:
+an ACTIVE segment can reuse that slot even while an old Python view survives.
 
 ## Construction choice
 
@@ -85,7 +86,7 @@ use real memfd-backed DRAM. Device-DAX results are separate evidence.
 
 ## L1 integration boundary
 
-The intended caller supplies this backend explicitly through the keyword-only
+The caller supplies this backend explicitly through the keyword-only
 `L1Manager(..., memory_manager=pool)` argument. The pool must have no live
 objects or draining segments. Initial capacity and alignment must match the
 L1 config. Lazy allocation, named SHM, hugepages, mlock, Device-DAX, and GDS
