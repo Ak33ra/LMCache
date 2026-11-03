@@ -1,0 +1,50 @@
+{
+  "mooncake_version": "0.3.14",
+  "python": "3.12.13",
+  "torch": "2.15.0+cu132",
+  "lmcache_import": "/scratch/akira/kvc-worktrees/store-owned/lmcache/__init__.py",
+  "script_sha256": "d4512213c84e3a2ed2664128e491f75e26d756d372a3849e588574c52345a7a0",
+  "observations": {
+    "placement": {
+      "owner_contribution_bytes": 0,
+      "peer_contribution_bytes": 16777216,
+      "put_preferred_owner_without_capacity": "succeeded_on_peer",
+      "prefixed_private_key_peer_read": "visible",
+      "store_owned_private_contract": "failed",
+      "peer": "127.0.0.1:48029"
+    },
+    "lend": {
+      "arena_bytes": 33554432,
+      "segment_bytes": 16777216,
+      "scratch_bytes_per_client": 8388608,
+      "grace_seconds": 0,
+      "cycles": [
+        {
+          "cycle": 0,
+          "shared_peer_bytes": 4096,
+          "private_consumed_bytes": 16777216,
+          "arena_backing_bytes": 33554432,
+          "store_mappings_after_unmount": 0
+        },
+        {
+          "cycle": 1,
+          "shared_peer_bytes": 4096,
+          "private_consumed_bytes": 16777216,
+          "arena_backing_bytes": 33554432,
+          "store_mappings_after_unmount": 0
+        },
+        {
+          "cycle": 2,
+          "shared_peer_bytes": 4096,
+          "private_consumed_bytes": 16777216,
+          "arena_backing_bytes": 33554432,
+          "store_mappings_after_unmount": 0
+        }
+      ],
+      "quiescent_lending": "passed",
+      "scope": "allocator_and_store_sdk_only",
+      "active_transfer_and_unregister_failure_safety": "unverified",
+      "peer": "127.0.0.1:40641"
+    }
+  }
+}
