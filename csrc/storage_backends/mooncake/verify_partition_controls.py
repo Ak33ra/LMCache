@@ -2,6 +2,7 @@
 """Exercise native partition controls against an isolated real TCP master."""
 
 # Standard
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import argparse
@@ -9,9 +10,11 @@ import ctypes
 import json
 import mmap
 import os
+import select
 import signal
 import socket
 import subprocess
+import threading
 import time
 
 # First Party
@@ -20,6 +23,7 @@ import lmcache.lmcache_mooncake as native
 MIB = 1024 * 1024
 PRIVATE_BYTES = 64 * 1024
 REQUESTED_SHARED_BYTES = 64 * MIB + 1
+Completion = tuple[int, bool, str, list[bool] | None]
 
 
 def free_port() -> int:
@@ -60,17 +64,152 @@ def success(result: native.PartitionControlResult) -> native.PartitionControlRes
     return result
 
 
-def completed(
-    client: native.LMCacheMooncakeClient, future: int
-) -> tuple[int, bool, str, list[bool] | None]:
+def completed(client: native.LMCacheMooncakeClient, future: int) -> Completion:
     """Wait for the native connector's terminal completion of one request."""
+    return completed_many(client, [future])[future]
+
+
+def completed_many(
+    client: native.LMCacheMooncakeClient, futures: list[int]
+) -> dict[int, Completion]:
+    """Drain exactly the accepted requests, rejecting missing or duplicate IDs."""
+    results = {}
     deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
+    while len(results) < len(futures) and time.monotonic() < deadline:
         for result in client.drain_completions():
-            assert result[0] == future
-            return result
+            assert result[0] in futures and result[0] not in results
+            results[result[0]] = result
         time.sleep(0.01)
-    raise TimeoutError(f"Native future {future} did not complete")
+    if len(results) != len(futures):
+        raise TimeoutError(
+            f"Native futures did not complete: {set(futures) - results.keys()}"
+        )
+    return results
+
+
+def rejected_submissions(
+    client: native.LMCacheMooncakeClient, source: memoryview, destination: memoryview
+) -> list[str]:
+    """Require each public submission to reject closing before returning a future."""
+    rejected = []
+    for name, submit in (
+        ("get", lambda: client.submit_batch_get(["closed"], [destination])),
+        ("set", lambda: client.submit_batch_set(["closed"], [source])),
+        ("exists", lambda: client.submit_batch_exists(["closed"])),
+        ("delete", lambda: client.submit_batch_delete(["closed"])),
+    ):
+        try:
+            future = submit()
+        except RuntimeError as error:
+            assert "closing" in str(error) or "closed" in str(error)
+            rejected.append(name)
+        else:
+            raise AssertionError(f"{name} returned future {future} after close")
+    assert client.drain_completions() == []
+    return rejected
+
+
+def concurrent_submissions(
+    client: native.LMCacheMooncakeClient, source: memoryview
+) -> int:
+    """Race four native producers against drain without losing ownership IDs."""
+    count = 128
+
+    def submit(worker: int) -> list[int]:
+        futures = []
+        for index in range(count // 4):
+            key = f"concurrent-{worker}-{index}"
+            if index % 2:
+                futures.append(client.submit_batch_exists([key]))
+            else:
+                futures.append(client.submit_batch_set([key], [source]))
+        return futures
+
+    def drain() -> dict[int, Completion]:
+        results = {}
+        deadline = time.monotonic() + 30
+        while len(results) < count and time.monotonic() < deadline:
+            for result in client.drain_completions():
+                assert result[0] not in results
+                assert result[1], result
+                results[result[0]] = result
+            time.sleep(0.001)
+        assert len(results) == count, (len(results), count)
+        return results
+
+    with ThreadPoolExecutor(5) as pool:
+        drained = pool.submit(drain)
+        submitted = list(pool.map(submit, range(4)))
+        results = drained.result(timeout=35)
+    assert set(results) == {future for batch in submitted for future in batch}
+    return count
+
+
+def close_race(
+    config: dict[str, str],
+    source: memoryview,
+    destination: memoryview,
+    initial_submissions: int,
+) -> dict[str, int]:
+    """Race all submission entry points with close, then drain and retry."""
+    client = native.LMCacheMooncakeClient(
+        {**config, "local_hostname": f"127.0.0.1:{free_port()}"},
+        1,
+        partition_controls=True,
+    )
+    for view in (source, destination):
+        success(
+            client.register_l1_buffer(
+                ctypes.addressof(ctypes.c_char.from_buffer(view)), len(view)
+            )
+        )
+    initial_futures = [
+        client.submit_batch_exists(["before-close-race"])
+        for _ in range(initial_submissions)
+    ]
+    barrier = threading.Barrier(5)
+
+    def submit(operation: Callable[[], int]) -> int | None:
+        barrier.wait(timeout=10)
+        try:
+            return operation()
+        except RuntimeError as error:
+            assert "closing" in str(error) or "closed" in str(error)
+            return None
+
+    def close() -> native.PartitionControlResult:
+        barrier.wait(timeout=10)
+        return client.close_partition()
+
+    with ThreadPoolExecutor(5) as pool:
+        attempts = [
+            pool.submit(submit, operation)
+            for operation in (
+                lambda: client.submit_batch_get(["close-race"], [destination]),
+                lambda: client.submit_batch_set(["close-race"], [source]),
+                lambda: client.submit_batch_exists(["close-race"]),
+                lambda: client.submit_batch_delete(["close-race"]),
+            )
+        ]
+        closing = pool.submit(close)
+        futures = [
+            future for attempt in attempts if (future := attempt.result()) is not None
+        ]
+        result = closing.result(timeout=30)
+    assert result.code in (
+        native.PartitionControlCode.BUSY,
+        native.PartitionControlCode.SUCCESS,
+    )
+    if result.code == native.PartitionControlCode.SUCCESS:
+        assert not initial_futures + futures, "Successful close discarded accepted work"
+    completed_many(client, initial_futures + futures)
+    success(client.close_partition())
+    rejected_submissions(client, source, destination)
+    return {
+        "initial_submissions": initial_submissions,
+        "accepted": len(futures),
+        "rejected": 4 - len(futures),
+    }
 
 
 def mapped(base: int, size: int) -> bool:
@@ -178,7 +317,15 @@ def run(master_binary: Path, output: Path, fail_mount: bool) -> None:
             assert allocation.snapshot.retained_failed_bytes == 0
             key = f"roundtrip-{cycle}"
             source[:] = expected
-            assert completed(client, client.submit_batch_set([key], [source_view]))[1]
+            future = client.submit_batch_set([key], [source_view])
+            assert select.select([client.event_fd()], [], [], 30)[0]
+            assert (
+                client.unregister_l1_buffer(source_id).code
+                == native.PartitionControlCode.BUSY
+            ), "Completed-but-undrained work lost its registration ownership"
+            assert client.close_partition().code == native.PartitionControlCode.BUSY
+            assert not client.partition_status().closing
+            assert completed(client, future)[1]
             source[:] = b"x" * PRIVATE_BYTES
             result = completed(
                 client, client.submit_batch_get([key], [destination_view])
@@ -205,6 +352,7 @@ def run(master_binary: Path, output: Path, fail_mount: bool) -> None:
                 }
             )
         records["cycles"] = cycles
+        records["completed_undrained_busy"] = True
         os.kill(master.pid, signal.SIGSTOP)
         with ThreadPoolExecutor(1) as pool:
             growth = pool.submit(client.allocate_shared_segment, REQUESTED_SHARED_BYTES)
@@ -227,6 +375,12 @@ def run(master_binary: Path, output: Path, fail_mount: bool) -> None:
             assert grown.snapshot.pending_shared_bytes == 0
             for segment in grown.segment_ids:
                 success(client.release_shared_segment(segment))
+        queued_allocation = success(
+            client.allocate_shared_segment(REQUESTED_SHARED_BYTES)
+        )
+        assert completed(
+            client, client.submit_batch_set(["queued-reference"], [source_view])
+        )[1]
         os.kill(master.pid, signal.SIGSTOP)
         try:
             future = client.submit_batch_exists(["blocked-master"])
@@ -238,6 +392,10 @@ def run(master_binary: Path, output: Path, fail_mount: bool) -> None:
                 time.sleep(0.01)
             else:
                 raise AssertionError("Did not observe worker SDK access")
+            queued_set = client.submit_batch_set(["queued-set"], [source_view])
+            queued_get = client.submit_batch_get(
+                ["queued-reference"], [destination_view]
+            )
             assert (
                 client.unregister_l1_buffer(source_id).code
                 == native.PartitionControlCode.BUSY
@@ -248,10 +406,26 @@ def run(master_binary: Path, output: Path, fail_mount: bool) -> None:
             records["busy_preserved"] = snapshot(client.partition_status())
         finally:
             os.kill(master.pid, signal.SIGCONT)
-        completed(client, future)
+        results = completed_many(client, [future, queued_set, queued_get])
+        assert all(result[1] for result in results.values())
+        assert results[queued_get][3] == [True]
+        assert destination[:] == source[:]
+        records["queued_data_completed"] = True
+        records["concurrent_submissions_drained"] = concurrent_submissions(
+            client, source_view
+        )
         deregistered = success(client.unregister_l1_buffer(source_id))
         assert deregistered.released_shared_bytes == 0
         assert source[:] == b"x" * PRIVATE_BYTES
+        for submit in (client.submit_batch_get, client.submit_batch_set):
+            try:
+                submit(["retired-buffer"], [source_view])
+            except RuntimeError as error:
+                assert "registration" in str(error)
+            else:
+                raise AssertionError(
+                    "Retired buffer was accepted for later registration"
+                )
         new_id = success(
             client.register_l1_buffer(source_base, PRIVATE_BYTES)
         ).local_buffer_id
@@ -260,8 +434,21 @@ def run(master_binary: Path, output: Path, fail_mount: bool) -> None:
             client.unregister_l1_buffer(source_id).code
             == native.PartitionControlCode.INVALID
         )
+        source[:] = b"b" * PRIVATE_BYTES
+        assert completed(
+            client, client.submit_batch_set(["replacement"], [source_view])
+        )[1]
+        source[:] = b"c" * PRIVATE_BYTES
+        result = completed(
+            client, client.submit_batch_get(["replacement"], [destination_view])
+        )
+        assert result[1] and result[3] == [True]
+        assert destination[:] == b"b" * PRIVATE_BYTES
+        records["same_address_replacement_bytes"] = True
         success(client.unregister_l1_buffer(new_id))
         success(client.unregister_l1_buffer(destination_id))
+        for segment in queued_allocation.segment_ids:
+            success(client.release_shared_segment(segment))
         if fail_mount:
             master.terminate()
             master.wait(timeout=10)
@@ -279,6 +466,9 @@ def run(master_binary: Path, output: Path, fail_mount: bool) -> None:
                 == failed.snapshot.retained_failed_bytes
             )
             records["retained_close"] = snapshot(retained_close.snapshot)
+            records["closing_rejected"] = rejected_submissions(
+                client, source_view, destination_view
+            )
             master = subprocess.Popen(master.args, stdout=log, stderr=subprocess.STDOUT)
             deadline = time.monotonic() + 15
             while True:
@@ -295,11 +485,19 @@ def run(master_binary: Path, output: Path, fail_mount: bool) -> None:
         assert not closed.snapshot.local_buffers
         assert success(client.close_partition()).snapshot.closed
         records["closed"] = snapshot(closed.snapshot)
+        records["closed_rejected"] = rejected_submissions(
+            client, source_view, destination_view
+        )
+        records["close_races"] = [
+            close_race(config, source_view, destination_view, pending)
+            for pending in (0, 1, 0, 1)
+        ]
         records["result"] = "PASS"
         (output / "summary.json").write_text(json.dumps(records, indent=2) + "\n")
         print(
             "PASS: private registration, shared grow/free, bytes, "
-            "BUSY retry, stale IDs, close"
+            "queued and undrained ownership, concurrent submit/drain/close, "
+            "stale IDs, closed admission"
         )
         print(
             json.dumps(
