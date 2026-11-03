@@ -7,7 +7,7 @@ C++ IStorageConnector interface, so no Redis or C++ build is needed.
 """
 
 # Standard
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 import ctypes
 import os
 import select
@@ -25,6 +25,9 @@ from lmcache.v1.distributed.api import (
     MemorySegment,
     MemoryTags,
     ObjectKey,
+)
+from lmcache.v1.distributed.l2_adapters.mooncake_capacity_controls import (
+    MooncakeCapacityControls,
 )
 from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
     NativeConnectorL2Adapter,
@@ -1631,3 +1634,51 @@ class TestPadBuffersToAlignment:
             assert adp_padded.get_usage().total_bytes_used == 4096
         finally:
             adp_padded.close()
+
+
+@pytest.mark.parametrize("failure", ["BUSY", "SDK_ERROR"])
+def test_retryable_capacity_close_keeps_completion_polling_alive(failure: str) -> None:
+    """A failed control close must not strand the adapter's completion queue."""
+
+    class ControlledClient(MockNativeConnector):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_attempts = 0
+
+        def close_partition(self) -> SimpleNamespace:
+            self.close_attempts += 1
+            return SimpleNamespace(
+                code=SimpleNamespace(
+                    name=failure if self.close_attempts == 1 else "SUCCESS"
+                ),
+                sdk_error=0,
+                local_buffer_id=0,
+                segment_ids=[],
+                released_shared_bytes=0,
+                snapshot=SimpleNamespace(
+                    enabled=True,
+                    closing=False,
+                    closed=self.close_attempts > 1,
+                    scratch_bytes=0,
+                    allocation_granularity_bytes=4096,
+                    pending_shared_bytes=0,
+                    shared_allocated_bytes=0,
+                    retained_failed_bytes=0,
+                    local_buffers=[],
+                    shared_segments=[],
+                ),
+            )
+
+    client = ControlledClient()
+    controls = MooncakeCapacityControls(client)
+    adapter = NativeConnectorL2Adapter(client, _MEMORY_TAGS, capacity_controls=controls)
+    assert adapter.get_capacity_controls() is controls
+    try:
+        with pytest.raises(RuntimeError, match="busy|failed"):
+            adapter.close()
+        task = adapter.submit_store_task([create_object_key(1)], [create_memory_obj()])
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert task in adapter.pop_completed_store_tasks()
+    finally:
+        adapter.close()
+    assert client.close_attempts == 2

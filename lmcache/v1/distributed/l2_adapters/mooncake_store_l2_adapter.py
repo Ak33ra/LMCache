@@ -9,6 +9,7 @@ from __future__ import annotations
 # Standard
 from typing import (
     TYPE_CHECKING,
+    Any,
     cast,
 )
 
@@ -30,6 +31,9 @@ from lmcache.v1.distributed.l2_adapters.config import (
 )
 from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
+)
+from lmcache.v1.distributed.l2_adapters.mooncake_capacity_controls import (
+    MooncakeCapacityControls,
 )
 
 logger = init_logger(__name__)
@@ -64,6 +68,9 @@ class MooncakeStoreL2AdapterConfig(L2AdapterConfigBase):
             (``"lookup"``, ``"retrieve"``, ``"store"``,
             ``"delete"``) to dedicated worker counts.  Ops
             not mentioned use the shared ``num_workers`` pool.
+        partition_controls: Internal capability selected by partition startup.
+            Requires the fenced SDK and native connector; ordinary config
+            parsing cannot enable it.
     """
 
     def __init__(
@@ -71,13 +78,15 @@ class MooncakeStoreL2AdapterConfig(L2AdapterConfigBase):
         setup_config: dict[str, str],
         num_workers: int = 4,
         per_op_workers: dict[str, int] | None = None,
-    ):
+        partition_controls: bool = False,
+    ) -> None:
         super().__init__()
         self.num_workers = L2AdapterConfigBase._validate_num_workers(num_workers)
         self.per_op_workers = L2AdapterConfigBase._validate_per_op_workers(
             per_op_workers
         )
         self.setup_config: dict[str, str] = dict(setup_config)
+        self.partition_controls = partition_controls
 
     @classmethod
     def from_dict(cls, d: dict[str, object]) -> "MooncakeStoreL2AdapterConfig":
@@ -97,6 +106,10 @@ class MooncakeStoreL2AdapterConfig(L2AdapterConfigBase):
             ValueError: If ``num_workers`` or ``per_op_workers`` values
                 are invalid.
         """
+        if "partition_controls" in d:
+            raise ValueError(
+                "partition_controls is owned by partition startup, not SDK config"
+            )
         num_workers = cast(int, d.get("num_workers", 4))  # validated in __init__
 
         per_op_workers = L2AdapterConfigBase._parse_per_op_workers_from_dict(d)
@@ -195,12 +208,15 @@ def _create_mooncake_store_l2_adapter(
             l1_registration.base = l1_memory_desc.ptr
             l1_registration.size = l1_memory_desc.size
 
-    native_client = LMCacheMooncakeClient(
-        config=config.setup_config,
-        num_workers=config.num_workers,
-        l1_registration=l1_registration,
-        per_op_workers=config.per_op_workers,
-    )
+    native_args: dict[str, Any] = {
+        "config": config.setup_config,
+        "num_workers": config.num_workers,
+        "l1_registration": l1_registration,
+        "per_op_workers": config.per_op_workers,
+    }
+    if config.partition_controls:
+        native_args["partition_controls"] = True
+    native_client = LMCacheMooncakeClient(**native_args)
     logger.info(
         "Created Mooncake Store L2 adapter "
         "(workers=%d, per_op_workers=%s, preregister_l1_memory=%s)",
@@ -209,7 +225,13 @@ def _create_mooncake_store_l2_adapter(
         l1_registration.enabled and l1_registration.size > 0,
     )
     return NativeConnectorL2Adapter(
-        native_client, MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE)
+        native_client,
+        MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE),
+        capacity_controls=(
+            MooncakeCapacityControls(native_client)
+            if config.partition_controls
+            else None
+        ),
     )
 
 

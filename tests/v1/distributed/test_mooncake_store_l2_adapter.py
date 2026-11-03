@@ -408,7 +408,7 @@ class TestMooncakeStoreL1RegistrationFactory:
         monkeypatch.setattr(
             native_connector_l2_adapter,
             "NativeConnectorL2Adapter",
-            lambda client, memory_tags: ("wrapped", client),
+            lambda client, memory_tags, **kwargs: ("wrapped", client),
         )
 
         config = MooncakeStoreL2AdapterConfig.from_dict(
@@ -461,7 +461,7 @@ class TestMooncakeStoreL1RegistrationFactory:
         monkeypatch.setattr(
             native_connector_l2_adapter,
             "NativeConnectorL2Adapter",
-            lambda client, memory_tags: ("wrapped", client),
+            lambda client, memory_tags, **kwargs: ("wrapped", client),
         )
 
         config = MooncakeStoreL2AdapterConfig.from_dict(
@@ -512,7 +512,7 @@ class TestMooncakeStoreL1RegistrationFactory:
         monkeypatch.setattr(
             native_connector_l2_adapter,
             "NativeConnectorL2Adapter",
-            lambda client, memory_tags: ("wrapped", client),
+            lambda client, memory_tags, **kwargs: ("wrapped", client),
         )
 
         config = MooncakeStoreL2AdapterConfig.from_dict(
@@ -991,3 +991,9 @@ class TestMooncakeStoreIntegration:
             adapter.submit_unlock([key])
         finally:
             adapter.close()
+
+
+def test_partition_controls_cannot_be_enabled_as_sdk_config() -> None:
+    """Partition startup owns this option and its lifetime requirements."""
+    with pytest.raises(ValueError, match="partition startup"):
+        MooncakeStoreL2AdapterConfig.from_dict({"partition_controls": True})

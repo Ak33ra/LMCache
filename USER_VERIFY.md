@@ -470,3 +470,22 @@ The alpha 0.3 request has effective alpha 0.25. Tests also cover rounding slack,
 exact large-integer endpoints, invalid JSON field sets, booleans, nonfinite
 fractions, and insufficient budgets. The root run on 2026-11-03 passed all
 37 tests with no skips in `/tmp/kvc-partition-config.log`.
+
+## M4c. Adapter capacity capability and retryable close
+
+From `LMCache/`, use the prepared CPU environment:
+
+```bash
+CUDA_VISIBLE_DEVICES='' LMCACHE_TRACK_USAGE=false PYTHONPATH=. \
+  NUMBA_CACHE_DIR=/tmp/kvc-capacity-adapter-numba \
+  /scratch/akira/lmcache-dev/bin/python -m pytest \
+  --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
+  tests/v1/distributed/test_native_connector_l2_adapter.py \
+  tests/v1/distributed/test_mooncake_store_l2_adapter.py -k 'not Integration'
+```
+
+Expected: 119 passed, one existing optional Redis-extension test skipped, and
+12 service tests deselected. The new controlled close tests refuse cleanup once
+with BUSY or SDK_ERROR, then prove object completion still arrives before retry.
+These are adapter contract tests, not live Store evidence. The native M4a probe
+runs actual queued operations and verifies physical ownership separately.

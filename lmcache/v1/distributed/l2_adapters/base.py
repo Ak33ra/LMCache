@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         ObjectKey,
     )
     from lmcache.v1.distributed.internal_api import L2AdapterListener, L2StoreResult
+    from lmcache.v1.distributed.partition_controls import SharedCapacityControls
     from lmcache.v1.memory_management import MemoryObj
 
 # First Party
@@ -386,6 +387,15 @@ class L2AdapterInterface(ABC):
             hosts.
         """
         pass
+
+    def get_capacity_controls(self) -> SharedCapacityControls | None:
+        """Return optional physical ownership controls on this adapter's client.
+
+        Ordinary adapters return None. A topology owner must retain caller
+        backing until these controls confirm local unregistration and must
+        charge all ownership in the returned snapshots.
+        """
+        return None
 
     #####################
     # Listener Interface

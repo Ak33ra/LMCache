@@ -37,6 +37,10 @@ from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2TaskId,
 )
+from lmcache.v1.distributed.partition_controls import (
+    CapacityControlCode,
+    SharedCapacityControls,
+)
 from lmcache.v1.memory_management import MemoryObj, TensorMemoryObj
 from lmcache.v1.platform import create_event_notifier
 
@@ -161,6 +165,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         type_name: str = "",
         extra_status: dict[str, Any] | None = None,
         pad_buffers_to_alignment: bool = False,
+        capacity_controls: SharedCapacityControls | None = None,
     ) -> None:
         """Initialize the adapter over a native connector client.
 
@@ -181,8 +186,12 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 native connectors whose I/O path requires aligned buffer
                 lengths (e.g. O_DIRECT file storage). See
                 ``_obj_to_memoryview``.
+            capacity_controls: Optional physical ownership controls on the
+                same native client. Failed close attempts keep completion
+                polling alive so accepted operations can finish.
         """
         super().__init__(max_capacity_bytes=int(max_capacity_gb * (1024**3)))
+        self._capacity_controls = capacity_controls
         self._client = native_client
         self._client_fd: int = int(native_client.event_fd())
         self._type_name: str = type_name or type(native_client).__name__
@@ -454,7 +463,25 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         """Return the memory tags given at construction."""
         return self._memory_tags
 
+    def get_capacity_controls(self) -> SharedCapacityControls | None:
+        """Return the optional ownership capability supplied at construction."""
+        return self._capacity_controls
+
     def close(self) -> None:
+        """Close after native ownership drains, keeping failed attempts retryable.
+
+        Raises:
+            RuntimeError: Capacity controls cannot yet confirm native cleanup.
+                Completion polling remains active and caller backing must stay
+                allocated until a later successful close.
+        """
+        if self._capacity_controls is not None:
+            result = self._capacity_controls.close()
+            if result.code is not CapacityControlCode.SUCCESS:
+                raise RuntimeError(
+                    f"Native cleanup retained ownership: {result.code.value} "
+                    f"(SDK error {result.sdk_error})"
+                )
         self._stop.set()
         self._demux_thread.join(timeout=5)
 
