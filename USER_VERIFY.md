@@ -412,3 +412,55 @@ The complete `test_multi_l1.py` file plus both focused lifetime files passed
 **37 tests, zero skipped** after trace compatibility was added. The separate
 process smoke also passed again. Logs are `/tmp/kvc-serving-trace.log` and
 `/tmp/kvc-serving-smoke-final.log`.
+
+
+## M4a — native CPU Mooncake ownership controls
+
+This unit adds opt-in native controls only. It does not enable MP partitioning.
+Build the optional connector against the completed strict CPU TCP fork, then
+run the real-master probes from this checkout:
+
+```bash
+MAX_JOBS=2 CUDA_VISIBLE_DEVICES='' /scratch/akira/lmcache-dev/bin/python \
+  csrc/storage_backends/mooncake/build_partition_connector.py \
+  --sdk-root /scratch/akira/kvc-worktrees/mooncake-fenced
+export CUDA_VISIBLE_DEVICES=''
+export LMCACHE_TRACK_USAGE=false
+export MC_TCP_REQUIRE_GENERATION=1
+export MC_NOF_BACKEND=none
+export PYTHONPATH="$PWD"
+/scratch/akira/lmcache-dev/bin/python \
+  csrc/storage_backends/mooncake/verify_partition_controls.py \
+  --master-bin /scratch/akira/kvc-worktrees/mooncake-fenced/build/mooncake-store/src/mooncake_master \
+  --output /tmp/kvc-native-partition-manual
+/scratch/akira/lmcache-dev/bin/python \
+  csrc/storage_backends/mooncake/verify_partition_controls.py \
+  --master-bin /scratch/akira/kvc-worktrees/mooncake-fenced/build/mooncake-store/src/mooncake_master \
+  --output /tmp/kvc-native-partition-recovery-manual --fail-mount
+```
+
+Use fresh output paths. Each probe starts and stops its own master and writes
+`summary.json`. Expect PASS, exact fetched bytes, zero shared capacity from
+private registrations alone, stale-ID rejection, `BUSY` preserving ownership,
+visible rounded pending growth, released shared mappings, and zero final
+scratch/shared charges. Private unregister must report zero physical release;
+caller-owned backing stays accessible until the caller frees it.
+
+The failure probe terminates the master before growth. Expect retained failed
+allocation bytes and unsuccessful close with zero release credit. It then
+restarts the master and retries close, releasing charges only after success.
+The supported boundary and control ordering are documented in
+[the native controls design](docs/design/v1/distributed/l2_adapters/mooncake_partition_controls.md).
+These checks make no GPU, RDMA, cross-host, or MP activation claim.
+
+Recorded on 2026-11-03: both live probes passed. The request was 64 MiB plus one
+byte; the SDK reported 80 MiB actual allocation and 16 MiB granularity. Both
+normal release mappings disappeared. Failed growth and failed close retained
+80 MiB plus 8 MiB scratch; recovery close reached zero. Evidence:
+`/tmp/kvc-native-controls-final/summary.json` and
+`/tmp/kvc-native-controls-final-recovery/summary.json`, with matching `.log`
+files. Stock 0.3.14 compiled as API 0, rejected partition mode before setup,
+and passed default native set/get/delete with exact bytes against its own real
+master (`/tmp/kvc-native-controls-stock-build.log` and
+`/tmp/kvc-native-controls-stock.log`). Stock compatibility is not ownership
+safety evidence. Sphinx retained the existing 26 warning baseline.
