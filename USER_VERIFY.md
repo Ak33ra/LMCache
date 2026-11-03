@@ -219,7 +219,7 @@ python -m pytest --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
   tests/v1/distributed/test_segmented_dram_l1.py
 ```
 
-Expected result: **9 passed, zero skipped**. Recorded on 2026-11-03 in the
+Expected result: **10 passed, zero skipped**. Recorded on 2026-11-03 in the
 U2a environment. The test constructs one `L1Manager` with a one-page segment,
 fills it, adds two pages, and fills both new pages. It drains and removes the
 original segment, verifies the surviving keys, adds another page, then removes
@@ -232,6 +232,11 @@ and the pool must have no live objects or drains. Tests reject conflicting
 configuration, GDS, and a second L1 owner. `get_l1_memory_desc()` returns `None`
 even when only one segment remains, because a removable segment cannot provide
 a fixed registration lifetime. No MP CLI enables this backend.
+
+The additional constructor-failure regression injects an event-bus setup
+error, then constructs a working L1 with the same still-mapped pool. Failed
+initialization leaves ownership available for retry. This injected case is
+cleanup evidence, separate from the live resize checks.
 
 Check unchanged L1 and Device-DAX behavior with:
 

@@ -241,7 +241,6 @@ class L1Manager(L1ManagerInterface):
         if memory_manager is not None:
             if config.gds_l1_config is not None:
                 raise ValueError("segmented DRAM cannot back a GDS configuration")
-            memory_manager.attach_to_l1(config.memory_config, self._l1_manager_id)
         self._config = config
         self._lock = threading.Lock()
 
@@ -300,7 +299,6 @@ class L1Manager(L1ManagerInterface):
         self._event_bus = get_event_bus()
 
         with L1Manager._gauge_lock:
-            L1Manager._gauge_targets[self._l1_manager_id] = self
             if not L1Manager._gauge_registered:
                 L1Manager._gauge_registered = True
                 register_gauge(
@@ -321,6 +319,9 @@ class L1Manager(L1ManagerInterface):
                     "Bytes held by L1 staging objects (write-reserved, not admitted)",
                     lambda: L1Manager._observations(_l1_staging_bytes_or_zero),
                 )
+            if memory_manager is not None:
+                memory_manager.attach_to_l1(config.memory_config, self._l1_manager_id)
+            L1Manager._gauge_targets[self._l1_manager_id] = self
 
     @property
     def l1_manager_id(self) -> int:

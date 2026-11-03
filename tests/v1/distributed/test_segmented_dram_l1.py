@@ -153,6 +153,35 @@ def test_l1_ownership_cannot_be_transferred_twice() -> None:
         first.close()
 
 
+def test_failed_l1_construction_leaves_pool_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = SegmentedDRAML1MemoryManager()
+    segment = pool.add_segment(PAGE)
+
+    def fail_event_bus():
+        raise RuntimeError("injected event bus failure")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                "lmcache.v1.distributed.l1_manager.get_event_bus", fail_event_bus
+            )
+            with pytest.raises(RuntimeError, match="injected event bus"):
+                L1Manager(_config(PAGE), memory_manager=pool)
+        assert pool.get_memory_usage() == (0, PAGE)
+        assert _mapped_bytes(segment.mapping_name) == PAGE
+        manager = L1Manager(_config(PAGE), memory_manager=pool)
+        try:
+            _write(manager, 0, 81)
+            _read(manager, 0, 81)
+        finally:
+            manager.close()
+        assert _mapped_bytes(segment.mapping_name) == 0
+    finally:
+        pool.close()
+
+
 def test_zero_capacity_l1_can_grow_and_return_to_zero() -> None:
     pool = SegmentedDRAML1MemoryManager()
     l1 = L1Manager(_config(0), memory_manager=pool)
