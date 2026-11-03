@@ -10,8 +10,11 @@ import threading
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.internal_api import L1AdmissionLimits, L1AdmissionState
-from lmcache.v1.distributed.l1_manager import L1Manager
+from lmcache.v1.distributed.internal_api import (
+    L1AdmissionLimits,
+    L1AdmissionState,
+    L1ManagerInterface,
+)
 from lmcache.v1.distributed.memory_manager.segmented_dram import (
     DRAMSegmentHandle,
     DRAMSegmentState,
@@ -97,7 +100,7 @@ class PartitionManager:
         self,
         config: PartitionConfig,
         pool: SegmentedDRAML1MemoryManager,
-        l1: L1Manager,
+        l1: L1ManagerInterface,
         controls: SharedCapacityControls,
         *,
         quiesce: Callable[[], bool],
@@ -129,7 +132,8 @@ class PartitionManager:
 
         Raises:
             ValueError: Initial topology or native reserves violate the contract.
-            RuntimeError: A control fails; retain this owner and retry cleanup.
+            RuntimeError: A control fails or is busy; retain this owner and
+                retry cleanup. Startup makes one attempt, without a worker.
         """
         if self._locals or self._thread is not None:
             raise RuntimeError("Partition initialization already attempted")
@@ -159,7 +163,8 @@ class PartitionManager:
         self._job = ResizeStatus("", self._config.alpha, target, ResizePhase.GROWING)
         self._publish()
         try:
-            self._register(self._locals[0])
+            if not self._register(self._locals[0]):
+                raise RuntimeError("Initial staging registration is busy")
             if not self._advance():
                 raise RuntimeError("Initial topology could not complete")
         except Exception as error:
@@ -315,8 +320,17 @@ class PartitionManager:
             )
         return True
 
-    def _register(self, mapping: _LocalMapping) -> None:
+    def _register(self, mapping: _LocalMapping) -> bool:
+        """Retry the same mapping until its exact registration is confirmed."""
         segment = self._pool.get_segment_status(mapping.handle)
+        if any(
+            item.registration_id == mapping.registration_id
+            and item.base == segment.base
+            and item.size == segment.mapped_bytes
+            and item.state is LocalRegistrationState.REGISTERED
+            for item in self._native.local_buffers
+        ):
+            return True
         try:
             result = self._controls.register_local(segment.base, segment.mapped_bytes)
         finally:
@@ -327,7 +341,9 @@ class PartitionManager:
             self._publish()
         # A failed registration can retain an exact native cleanup identity.
         mapping.registration_id = result.local_buffer_id or mapping.registration_id
-        if not self._accept(result) or not any(
+        if not self._accept(result):
+            return False
+        if not any(
             item.registration_id == mapping.registration_id
             and item.base == segment.base
             and item.size == segment.mapped_bytes
@@ -335,6 +351,7 @@ class PartitionManager:
             for item in self._native.local_buffers
         ):
             raise RuntimeError("Local registration incomplete")
+        return True
 
     def _remove(self, mapping: _LocalMapping) -> bool:
         segment = self._pool.begin_drain(mapping.handle)
@@ -401,6 +418,9 @@ class PartitionManager:
                     raise RuntimeError("Shared release did not confirm physical credit")
             self._rebuild = False
             self._job = replace(self._job, phase=ResizePhase.GROWING)
+        for mapping in self._locals:
+            if not self._register(mapping):
+                return False
         while (
             len(self._locals) - 1
             < target.private_effective_bytes // target.granularity_bytes
@@ -416,7 +436,8 @@ class PartitionManager:
             self._locals.append(mapping)
             self._pending = 0
             self._publish()
-            self._register(mapping)
+            if not self._register(mapping):
+                return False
         while self._native.shared_allocated_bytes < target.shared_effective_bytes:
             self._reserve(target.granularity_bytes)
             previous = self._native.shared_allocated_bytes

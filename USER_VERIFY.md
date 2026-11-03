@@ -765,3 +765,28 @@ errors at lines 134–135, outside this change. Sphinx was run with
 `-W --keep-going -b html docs/source /tmp/kvc-validation-docs` using the
 existing `dram-segments-docs-env`; it reports the same 26 baseline diagnostics
 recorded in U4b. Its log is `/tmp/kvc-validation-docs.log`.
+
+## U-PARTITION-BUSY. Retry private registration without replacing backing
+
+Run from this checkout in the prepared CPU environment:
+
+```bash
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=. \
+  /scratch/akira/lmcache-dev/bin/python -m pytest --noconftest \
+  -o log_cli=false -q tests/v1/distributed/test_partition_manager.py
+```
+
+Expect ten passing tests with no skips. The controlled capability returns
+repeated `BUSY` for private registration and shared allocation while real
+segmented mappings remain allocated. The checks require closed admission,
+stable mapped bytes, repeated registration of the same address, no duplicate
+successful registrations, and exact final capacity after contention clears.
+Failed registration retains its mapped charge until explicit rebuild.
+Synchronous startup `BUSY` is terminal and retains backing until `close()`
+succeeds. Keep the owner and L1 alive during cleanup.
+
+Recorded 2026-11-03 in Python 3.12.13. The original manager failed the new
+private-registration regression by reaching `FAILED` on its first `BUSY`.
+The baseline log is `/tmp/kvc-busy-registration-baseline.log`. The repaired
+suite passed ten tests. These checks use controlled backend outcomes and real
+CPU mappings, not a live Store service or MP integration.

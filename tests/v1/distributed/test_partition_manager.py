@@ -41,6 +41,11 @@ class Controls:
         self.fail_release = False
         self.fail_close = False
         self.fail_register = False
+        self.busy_register = False
+        self.busy_allocate = False
+        self.registration_attempts: list[tuple[int, int]] = []
+        self.busy_attempts = 0
+        self.repeated_busy = threading.Event()
         self.block: threading.Event | None = None
         self.entered = threading.Event()
         self.unregistered: list[int] = []
@@ -49,6 +54,13 @@ class Controls:
         return self.state
 
     def register_local(self, base: int, size: int) -> Result:
+        self.registration_attempts.append((base, size))
+        if self.busy_register:
+            self.busy_attempts += 1
+            if self.busy_attempts >= 3:
+                self.repeated_busy.set()
+            return Result(Code.BUSY, 0, self.state)
+        assert all(item.base != base for item in self.state.local_buffers)
         self.sequence += 1
         item = LocalRegistration(
             self.sequence, base, size, LocalRegistrationState.REGISTERED
@@ -77,6 +89,11 @@ class Controls:
         return Result(Code.SUCCESS, 0, self.state)
 
     def allocate_shared(self, size: int) -> Result:
+        if self.busy_allocate:
+            self.busy_attempts += 1
+            if self.busy_attempts >= 3:
+                self.repeated_busy.set()
+            return Result(Code.BUSY, 0, self.state)
         if self.block is not None:
             self.entered.set()
             assert self.block.wait(5)
@@ -292,6 +309,9 @@ def test_failed_private_registration_rebuilds_before_reopening() -> None:
         manager.request_resize("private", 1.0)
         wait(manager, "private", ResizePhase.FAILED)
         assert manager.get_status().mapped_bytes == 2 * PAGE
+        assert manager.get_status().charged_bytes == 3 * PAGE
+        assert manager.get_status().pending_growth_bytes == 0
+        assert manager.get_status().quiesced
         failed_id = controls.snapshot().local_buffers[-1].registration_id
         controls.fail_register = False
         manager.request_resize("private", 1.0)
@@ -335,3 +355,65 @@ def test_exact_read_blocks_force_clear_and_shutdown() -> None:
     assert manager.close()
     assert pool.get_memory_usage() == (0, 0)
     l1.close()
+
+
+@pytest.mark.parametrize("alpha", [0.0, 1.0])
+def test_repeated_busy_growth_retries_same_backing(alpha: float) -> None:
+    manager, l1, _, controls = setup(1.0 - alpha)
+    try:
+        manager.initialize()
+        initial_attempts = len(controls.registration_attempts)
+        controls.busy_register = alpha == 1.0
+        controls.busy_allocate = alpha == 0.0
+        manager.request_resize("busy", alpha)
+        assert controls.repeated_busy.wait(5)
+        status = manager.get_status()
+        assert status.resize.phase is ResizePhase.GROWING
+        assert status.quiesced
+        assert status.mapped_bytes == (2 if alpha else 1) * PAGE
+        assert status.charged_bytes == (3 if alpha else 2) * PAGE
+        assert status.pending_growth_bytes == 0
+        assert len(status.shared.local_buffers) == 1
+        with manager.admission() as allowed:
+            assert not allowed
+        if alpha:
+            attempts = controls.registration_attempts[initial_attempts:]
+            assert len(attempts) >= 3
+            assert len(set(attempts)) == 1
+        controls.busy_register = False
+        controls.busy_allocate = False
+        wait(manager, "busy")
+        status = manager.get_status()
+        assert status.charged_bytes == 6 * PAGE
+        assert status.mapped_bytes == (5 if alpha else 1) * PAGE
+        assert status.shared.shared_allocated_bytes == (0 if alpha else 4) * PAGE
+        assert len(status.shared.local_buffers) == (5 if alpha else 1)
+        assert not status.quiesced
+    finally:
+        controls.busy_register = False
+        controls.busy_allocate = False
+        assert manager.close()
+        l1.close()
+
+
+def test_busy_staging_start_retains_owner_for_cleanup() -> None:
+    manager, l1, pool, controls = setup()
+    try:
+        controls.busy_register = True
+        with pytest.raises(RuntimeError, match="staging registration is busy"):
+            manager.initialize()
+        status = manager.get_status()
+        assert status.resize.phase is ResizePhase.FAILED
+        assert status.mapped_bytes == PAGE
+        assert status.charged_bytes == 2 * PAGE
+        assert status.quiesced
+        assert len(controls.registration_attempts) == 1
+        controls.fail_close = True
+        assert not manager.close()
+        assert pool.get_memory_usage() == (0, PAGE)
+        with pytest.raises(RuntimeError, match="already attempted"):
+            manager.initialize()
+    finally:
+        controls.fail_close = False
+        assert manager.close()
+        l1.close()
