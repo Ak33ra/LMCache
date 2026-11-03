@@ -289,6 +289,8 @@ reclaimed; status requires process exit because acceptance cannot be resolved.
 The adapter in these tests is controlled Python code. A further case starts
 shutdown during handle acquisition and verifies that the undispatched batch
 releases its handles without submitting to the adapter.
+The three terminal-result cases also repeat successful shutdown, as required
+when a containing storage manager retries cleanup after another tier stalls.
 
 Adding both M3 test files to U0a gives **321 passed, zero skipped**, recorded
 on 2026-11-03. Both U2 commands also passed against the real CPU native

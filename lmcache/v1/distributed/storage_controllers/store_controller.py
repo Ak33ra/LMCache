@@ -339,6 +339,7 @@ class StoreController(StorageControllerInterface):
                 rejection. Its allocations remain quarantined until process exit.
 
         Note:
+            Repeated calls after successful shutdown are harmless.
             Neither a shutdown request nor a timeout releases allocation handles.
             A submission already being dispatched may finish after stop begins;
             it remains tracked and must drain before shutdown can succeed.
@@ -347,8 +348,8 @@ class StoreController(StorageControllerInterface):
         """
         self._stop_flag.set()
         self._listener.stop_admission()
-        # Wake up the poll loop so it can exit promptly
-        self._listener.notify()
+        if self._thread.is_alive():
+            self._listener.notify()
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
             raise TimeoutError("Store shutdown is waiting for buffer completion")

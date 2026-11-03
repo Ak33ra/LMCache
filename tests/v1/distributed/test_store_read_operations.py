@@ -144,6 +144,7 @@ def test_store_pins_until_completion_and_shutdown_drain(
         adapter.resume.set()
         controller.stop(timeout=5)
         stopped = True
+        controller.stop(timeout=0)
         assert adapter.observed == [expected]
         assert manager.report_status()["active_read_operation_count"] == 0
         assert manager.get_memory_usage()[0] == retained_bytes
