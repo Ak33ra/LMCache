@@ -442,3 +442,31 @@ reservation timeout. Only source-side successful reservations enter the trace.
 EOF and interrupted dispatch must leave zero staging allocations. Source
 capabilities and owner IDs never enter the file. These CPU checks exercise
 storage bookkeeping and native TTL locks, not tensor payload replay.
+
+## M4b. Physical capacity targets
+
+This unit validates the budget and computes targets. It does not activate MP
+partitioning or claim that these bytes are allocated.
+
+```bash
+cd /home/akira/kvc-partitioning/LMCache
+CUDA_VISIBLE_DEVICES='' LMCACHE_TRACK_USAGE=false PYTHONPATH=. \
+  /scratch/akira/lmcache-dev/bin/python -m pytest --confcutdir=tests/v1 \
+  -o addopts='' -o log_cli=false -q tests/v1/distributed/test_partition_config.py
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=. /scratch/akira/lmcache-dev/bin/python - <<'PYTHON'
+from dataclasses import asdict
+import json
+from lmcache.v1.distributed.partition_config import PartitionConfig
+mib = 1 << 20
+config = PartitionConfig(88 * mib, 16 * mib, 8 * mib, 0.5)
+for alpha in (0, 0.3, 0.5, 1):
+    print(json.dumps({"alpha": alpha, **asdict(config.capacity(16*mib, alpha=alpha))}))
+PYTHON
+```
+
+Expect 37 tests to pass. The printed private/shared effective MiB pairs are
+0/64, 16/48, 32/32, and 64/0. Temporary and SDK reserves remain 16 and 8 MiB.
+The alpha 0.3 request has effective alpha 0.25. Tests also cover rounding slack,
+exact large-integer endpoints, invalid JSON field sets, booleans, nonfinite
+fractions, and insufficient budgets. The root run on 2026-11-03 passed all
+37 tests with no skips in `/tmp/kvc-partition-config.log`.
