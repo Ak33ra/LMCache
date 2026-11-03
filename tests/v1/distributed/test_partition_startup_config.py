@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Partition activation must reject paths without the verified ownership model."""
 
 # Standard
 from dataclasses import replace
