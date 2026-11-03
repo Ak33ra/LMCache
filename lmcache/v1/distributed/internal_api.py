@@ -52,6 +52,27 @@ class L1ReadOperation:
 L1ReadOperationResult = tuple[L1Error, L1ReadOperation | None]
 
 
+@dataclass(frozen=True, eq=False)
+class L1WriteOperation:
+    """Own an unpublished destination until all local writer access ends.
+
+    Attributes:
+        manager_id: Identity of the issuing manager.
+        operation_id: Unique operation within that manager.
+        memory_obj: Exact destination allocation, unreadable until admission.
+
+    Only the original handle can complete the operation. TTL expiry, timeout,
+    and cancellation do not release it. Handles are process-local capabilities.
+    """
+
+    manager_id: int
+    operation_id: int
+    memory_obj: MemoryObj
+
+
+L1WriteOperationResult = tuple[L1Error, L1WriteOperation | None]
+
+
 @dataclass(frozen=True)
 class L1MemoryDesc:
     """Describe the contiguous L1 memory arena exposed to external backends.
@@ -328,6 +349,26 @@ class L1ManagerInterface(Protocol):
         self, keys: list[ObjectKey], read_locks: int = 1
     ) -> dict[ObjectKey, L1Error]:
         """Release ``read_locks`` read locks on each key."""
+        ...
+
+    def reserve_write_operations(
+        self,
+        keys: list[ObjectKey],
+        is_temporary: list[bool],
+        layout_desc: MemoryLayoutDesc,
+        tag: str = "",
+    ) -> dict[ObjectKey, L1WriteOperationResult]:
+        """Allocate unpublished destinations pinned until explicit completion."""
+        ...
+
+    def finish_write_operations(
+        self,
+        operations: list[L1WriteOperation],
+        *,
+        discard: frozenset[L1WriteOperation] = frozenset(),
+        read_locks: int = 1,
+    ) -> dict[L1WriteOperation, L1OperationResult]:
+        """Complete exact destinations, discarding failures or admitting reads."""
         ...
 
     def reserve_write(

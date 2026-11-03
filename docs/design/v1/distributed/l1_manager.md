@@ -127,3 +127,29 @@ prove native or transport quiescence, protect prefetch staging writes, or
 convert legacy serving reads. Unconverted paths remain subject to TTL expiry.
 `test_l1_read_operations.py` verifies real CPU bytes, expiry, force clear,
 failed close, handle admission, batch validation, and discard across key reuse.
+
+
+## Explicit destination write operations
+
+`reserve_write_operations(keys, is_temporary, layout_desc, tag)` allocates
+unpublished destinations and returns original `L1WriteOperation` capabilities.
+Their registry entries bind exact staging allocations. TTL expiry never permits
+reuse, admission by a legacy finish call, or reclamation through eviction,
+forced deletion, clear, or close. `active_write_operation_count` reports live
+capabilities; their bytes are already included in staging and allocated bytes.
+
+After **all local destination access ends**, call
+`finish_write_operations(handles, discard=failed_handles, read_locks=n)`.
+It validates the entire batch before changing state. Stale, copied, foreign,
+and repeated handles are rejected without releasing any allocation. Failed
+handles free only their own unpublished bytes. Successful handles atomically
+admit their destination and acquire serving TTL read locks. If another writer
+already admitted the key, its resident allocation wins and receives the locks.
+Serving TTL lifetime remains separate from operation ownership.
+
+Timeout and cancellation are not completion. A caller must retain handles until
+local writes have stopped, and unknown submission outcomes must fail closed.
+Completed handles leave no registry tombstones. The real-buffer regression in
+`tests/v1/distributed/test_l1_write_operations.py` pauses a writer past native
+TTL expiry, attempts every reclaim path, then verifies its late bytes and
+same-key replacement protection. It does not claim native Store drain evidence.
