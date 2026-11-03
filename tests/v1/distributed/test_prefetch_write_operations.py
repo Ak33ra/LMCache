@@ -19,10 +19,12 @@ from lmcache.v1.distributed.api import (
     GroupedObjectKeys,
     MemoryLayoutDesc,
     ObjectKey,
+    PrefetchLockMode,
     PrefetchTaskSpec,
 )
 from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
 from lmcache.v1.distributed.error import L1Error
+from lmcache.v1.distributed.internal_api import L1AdmissionLimits
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
     MockL2Adapter,
@@ -339,3 +341,60 @@ def test_partial_submission_tracks_each_destination_owner() -> None:
         if child.is_alive():
             child.kill()
             child.join(timeout=5)
+
+
+@pytest.mark.parametrize("retained_bytes", [0, 4096])
+def test_prefetch_retention_falls_back_to_temporary(retained_bytes: int) -> None:
+    """A locked remote hit remains readable without private retention quota."""
+    manager, adapter = make_manager(), PausedLoadAdapter()
+    manager.set_admission_limits(L1AdmissionLimits(retained_bytes, 4096))
+    controller = make_controller(manager, adapter)
+    controller.start()
+    try:
+        request = controller.submit_prefetch_request(make_spec())
+        assert adapter.entered.wait(5)
+        adapter.resume.set()
+        assert controller.wait_prefetch_result(request, timeout=5)
+        result = controller.query_prefetch_result(request)
+        assert result is not None and result.hit_cells[0].popcount() == 1
+        error, obj = manager.unsafe_read([KEY])[KEY]
+        assert error is L1Error.SUCCESS and obj is not None
+        assert torch.all(obj.get_tensor(0) == 7)
+        manager.finish_read([KEY])
+        usage = manager.get_admission_usage()
+        assert usage.temporary_allocated_bytes == 0
+        assert usage.retained_allocated_bytes == retained_bytes
+        assert manager.reserve_read([KEY])[KEY][0] is (
+            L1Error.SUCCESS if retained_bytes else L1Error.KEY_NOT_EXIST
+        )
+        if retained_bytes:
+            manager.finish_read([KEY])
+    finally:
+        adapter.resume.set()
+        controller.stop(timeout=5)
+        adapter.close()
+        manager.close()
+
+
+def test_unlocked_prefetch_requires_retention_capacity() -> None:
+    """An unlocked result cannot promise a hit in disposable temporary storage."""
+    manager, adapter = make_manager(), PausedLoadAdapter()
+    manager.set_admission_limits(L1AdmissionLimits(0, 4096))
+    controller = make_controller(manager, adapter)
+    controller.start()
+    try:
+        request = controller.submit_prefetch_request(
+            PrefetchTaskSpec(
+                key_groups=make_spec().key_groups,
+                lock_mode=PrefetchLockMode.NO_LOCK,
+            )
+        )
+        assert controller.wait_prefetch_result(request, timeout=5)
+        result = controller.query_prefetch_result(request)
+        assert result is not None and result.hit_cells[0].popcount() == 0
+        assert not adapter.entered.is_set()
+        assert manager.get_memory_usage()[0] == 0
+    finally:
+        controller.stop(timeout=5)
+        adapter.close()
+        manager.close()

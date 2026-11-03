@@ -32,11 +32,12 @@ backing, and a finite alpha in [0, 1]. Capacity calculation rejects a budget
 that cannot fit one native segment. Startup must separately compare actual
 SDK scratch with its allowance and validate the supported native control API.
 
-Targets are not physical credit. The future resize controller must retain
+Targets are not physical credit. The resize controller retains
 charges for live, draining, failed, and pending allocations until release is
 confirmed. Registration bytes, used slots, and pinned subsets must not be added
 to their already-counted backing. Worker tensors, RPC payloads, metadata, and
-process RSS are outside D and require separate bounds or observations.
+process RSS are outside D and require separate bounds or observations. The
+opt-in MP integration is described in [partition ownership](partition_manager.md).
 
 [Manual checks](../../../../USER_VERIFY.md#m4b-physical-capacity-targets) print the
 requested and effective splits and test numeric validation. They are arithmetic

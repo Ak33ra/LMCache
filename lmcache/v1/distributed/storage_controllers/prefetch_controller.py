@@ -240,7 +240,7 @@ def _reserve_l1_cells(
     l1_manager: L1ManagerInterface,
     key_groups: list[GroupedObjectKeys],
     cells: Bitmap2D,
-    retain: dict[ObjectKey, bool],
+    retain: dict[ObjectKey, L1WriteRetention],
     tag: str,
 ) -> tuple[Bitmap2D, dict[ObjectKey, L1WriteOperation], int]:
     """Reserve a staging buffer in one L1 manager for every cell in ``cells``.
@@ -252,8 +252,8 @@ def _reserve_l1_cells(
         key_groups: The request's rows; row ``i`` of ``cells`` selects keys
             from ``key_groups[i]``.
         cells: The cells to reserve.
-        retain: Whether each key in ``cells`` stays resident after the
-            reader is done.
+        retain: The requested lifetime of each destination. Read-locked
+            requests may fall back to temporary storage.
         tag: The writer tag for the reservations.
 
     Returns:
@@ -273,10 +273,7 @@ def _reserve_l1_cells(
         keys = row.gather(group.keys)
         results = l1_manager.reserve_write_operations(
             keys=keys,
-            retention=[
-                L1WriteRetention.RETAIN if retain[key] else L1WriteRetention.TEMPORARY
-                for key in keys
-            ],
+            retention=[retain[key] for key in keys],
             layout_desc=group.layout_desc,
             tag=tag,
         )
@@ -544,6 +541,7 @@ class PrefetchController(StorageControllerInterface):
         # Thread-safe submission queue (external -> background)
         self._submission_lock = threading.Lock()
         self._submission_queue: list[tuple[PrefetchRequestId, PrefetchTaskSpec]] = []
+        self._accepted_requests: set[PrefetchRequestId] = set()
         self._next_request_id: PrefetchRequestId = 0
         self._submission_efd = create_event_notifier()
 
@@ -653,8 +651,9 @@ class PrefetchController(StorageControllerInterface):
         with self._submission_lock:
             if self._stop_flag.is_set():
                 raise RuntimeError("Prefetch controller is stopping")
-            self._submission_queue.append((request_id, spec))
             self._submission_efd.notify()
+            self._accepted_requests.add(request_id)
+            self._submission_queue.append((request_id, spec))
         return request_id
 
     def query_prefetch_result(
@@ -700,6 +699,15 @@ class PrefetchController(StorageControllerInterface):
             return self._prefetch_results_cv.wait_for(
                 lambda: request_id in self._completed_results, timeout=timeout
             )
+
+    def has_pending_work(self) -> bool:
+        """Whether an accepted async request still owns queued or native work.
+
+        Completed serving reservations are excluded. This predicate is stable
+        only while the caller prevents new submit_prefetch_request calls.
+        """
+        with self._submission_lock:
+            return bool(self._accepted_requests)
 
     def report_status(self) -> dict:
         """Return a status dict for the prefetch controller."""
@@ -1124,6 +1132,9 @@ class PrefetchController(StorageControllerInterface):
                 request = self._in_flight_requests.get(request_id)
                 if request is not None:
                     self._abort_request(request)
+                else:
+                    with self._submission_lock:
+                        self._accepted_requests.discard(request_id)
 
     def _can_admit_new_prefetch(self, spec: PrefetchTaskSpec) -> bool:
         """Return whether the pending request ``spec`` may start now.
@@ -1499,7 +1510,7 @@ class PrefetchController(StorageControllerInterface):
 
     def _build_l1_allocation_plans(
         self, request: InFlightPrefetchRequest
-    ) -> tuple[dict[int, Bitmap2D], dict[ObjectKey, bool]]:
+    ) -> tuple[dict[int, Bitmap2D], dict[ObjectKey, L1WriteRetention]]:
         """Group the request's L2 load plan by the L1 manager that will
         receive each adapter's keys, deciding retention along the way.
 
@@ -1509,25 +1520,30 @@ class PrefetchController(StorageControllerInterface):
         Returns:
             A tuple of allocation plan and retention plan. More specifically:
             - L1 Manager index -> the bitmap indicating which key to reserve write
-            - Object key -> whether the key need to retain in L1 after L1-L0 retrieve
+            - Object key -> requested lifetime of the destination
 
         Note:
-            Under ``NO_LOCK`` every key is retained; otherwise the policy
-            decides per (L1 manager, L2 adapter) pair.
+            Under ``NO_LOCK`` every key must be retained. A read-locked key
+            may use temporary quota when preferred retained quota is full.
         """
         cells_by_l1: dict[int, Bitmap2D] = {}
-        retain: dict[ObjectKey, bool] = {}
+        retain: dict[ObjectKey, L1WriteRetention] = {}
         for l2_idx, planned in request.key_states.l2_locked_keys.items():
             l1_idx = self._get_l2_affinity_manager(l2_idx)
             keys = _gather_keys(request.key_groups, planned)
             if request.lock_mode == PrefetchLockMode.NO_LOCK:
-                retention = [True] * len(keys)
+                retention = [L1WriteRetention.RETAIN] * len(keys)
             else:
-                retention = self._policy.plan_l1_retention(
-                    keys,
-                    self._l1_manager_descriptors[l1_idx],
-                    self._adapter_descriptors[l2_idx],
-                )
+                retention = [
+                    L1WriteRetention.PREFER_RETAIN
+                    if keep
+                    else L1WriteRetention.TEMPORARY
+                    for keep in self._policy.plan_l1_retention(
+                        keys,
+                        self._l1_manager_descriptors[l1_idx],
+                        self._adapter_descriptors[l2_idx],
+                    )
+                ]
             retain.update(zip(keys, retention, strict=True))
             if l1_idx in cells_by_l1:
                 cells_by_l1[l1_idx] += planned
@@ -1792,6 +1808,8 @@ class PrefetchController(StorageControllerInterface):
     def _retire_request(self, request: InFlightPrefetchRequest) -> None:
         """Remove a finished request from the in-flight table."""
         self._in_flight_requests.pop(request.request_id, None)
+        with self._submission_lock:
+            self._accepted_requests.discard(request.request_id)
 
     def _discard_write_operations(
         self, request: InFlightPrefetchRequest, l1_idx: int, keys: list[ObjectKey]

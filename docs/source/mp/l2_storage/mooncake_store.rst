@@ -137,3 +137,58 @@ The build and live-master verification commands are documented in
 ``docs/design/v1/distributed/l2_adapters/mooncake_partition_controls.md``.
 The checked-in probe is
 ``csrc/storage_backends/mooncake/verify_partition_controls.py``.
+
+Opt-in private/shared partitioning
+----------------------------------
+
+The MP server accepts ``--kv-partition`` with four explicit fields:
+
+.. code-block:: json
+
+    {"total_bytes": 92274688, "staging_bytes": 16777216,
+     "sdk_scratch_bytes": 8388608, "alpha": 0.5}
+
+This reserves 16 MiB for temporary L1 operations and 8 MiB for SDK scratch.
+The remaining 64 MiB is split into private and shared backing in whole native
+segments. With the tested 16 MiB granule, alpha 0.5 gives 32 MiB to each.
+The total bounds managed cache backing. RPC buffers, worker tensors, runtime
+metadata, and process RSS are separate.
+
+This experimental path requires the fenced CPU TCP SDK, the default MP engine,
+ZMQ, engine-driven typed-inline transfer, and an empty SHM name. Set
+``MC_TCP_REQUIRE_GENERATION=1`` and ``MC_NOF_BACKEND=none``. Configure exactly
+one Mooncake adapter with ``protocol=tcp``, ``global_segment_size=0``, and
+``local_buffer_size`` equal to the decimal SDK scratch byte count. Partitioning
+owns L1 capacity, backing, and policy selection. Conflicting legacy settings,
+GPU/SHM transfer, P2P, plugins, run-script access, and trace capture are rejected.
+
+While shared capacity is nonzero, new writes become visible only after shared
+publication. Reads can retain an independent private copy, or use temporary
+storage when private quota is full. At alpha zero, reads use temporary storage
+and leave no private copy. At alpha one, writes stay private and remote lookup
+is disabled. The default mode without ``--kv-partition`` remains available.
+
+Each accepted ZMQ request has an 8 MiB wire-payload ceiling, with at most four
+accepted requests and a 32 MiB per-request inline-copy workspace ceiling.
+Oversized requests fail before copying into cache backing. These limits do not
+bound rejected input transients, socket buffers, or whole-process RSS.
+
+The HTTP management port exposes cached ownership and asynchronous resize:
+
+.. code-block:: bash
+
+    curl -fsS http://127.0.0.1:8000/partition | python -m json.tool
+    curl -fsS -H 'Content-Type: application/json' \
+      -d '{"request_id":"manual-1","alpha":1.0}' \
+      http://127.0.0.1:8000/partition/resize | python -m json.tool
+    curl -fsS http://127.0.0.1:8000/partition/resize/manual-1 \
+      | python -m json.tool
+
+Admission pauses while resize drains operations and reclaims backing. A resize
+can evict cached objects. Only confirmed release permits opposite-owner growth.
+Repeated request IDs with the same alpha return the same job; a changed target
+or another concurrent resize returns HTTP 409. Failed jobs remain quiesced with
+their actual backing charged. Inspect status before retrying the same request.
+
+``USER_VERIFY.md`` records the focused CPU checks. The surrounding partitioning
+project supplies the pinned SDK build recipe and live two-server harness.

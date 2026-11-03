@@ -790,3 +790,39 @@ private-registration regression by reaching `FAILED` on its first `BUSY`.
 The baseline log is `/tmp/kvc-busy-registration-baseline.log`. The repaired
 suite passed ten tests. These checks use controlled backend outcomes and real
 CPU mappings, not a live Store service or MP integration.
+
+## U-ACTIVATION. CPU partition configuration and inline admission
+
+Run from this checkout in the prepared CPU environment:
+
+```bash
+CUDA_VISIBLE_DEVICES='' LMCACHE_TRACK_USAGE=false PYTHONPATH=. \
+  /scratch/akira/lmcache-dev/bin/python -m pytest --confcutdir=tests/v1 \
+  -o addopts='' -o log_cli=false -q \
+  tests/v1/distributed/test_partition_config.py \
+  tests/v1/distributed/test_partition_startup_config.py \
+  tests/v1/distributed/test_partition_manager.py \
+  tests/v1/distributed/test_prefetch_write_operations.py \
+  tests/v1/multiprocess/test_inline_operation_lifetimes.py \
+  tests/v1/multiprocess/test_request_limits.py
+```
+
+The checks cover exact byte budgets, rejected conflicting startup settings,
+physical resize with controlled backend outcomes, temporary fallback for a
+locked remote read, and strict retention for an unlocked prefetch. Real CPU
+inline copies reject excess workspace and report failure when no cache slot
+is available. These checks do not start a live Store service. Follow the outer
+project's `USER_VERIFY.md` for the native two-process endpoint, same-PID resize,
+and byte-checked workload commands.
+
+See [activation](docs/source/mp/l2_storage/mooncake_store.rst) for the four-field
+CLI configuration and HTTP inspection commands. Partitioning remains opt-in
+and is limited to the verified CPU typed-inline path.
+
+Recorded 2026-11-03 in Python 3.12.13 with the compiled CPU extensions.
+The command above passed 95 tests, with no skips. The selected legacy multi-L1
+and transfer caller suite separately passed 81 tests with one CUDA skip.
+Mypy passed the 11 changed production modules; Ruff, isort, codespell, and
+whitespace checks passed. The strict Sphinx build passed without warnings
+after the separate baseline documentation repair. Live two-server checks
+also passed; their commands and full provenance belong to the outer guide.

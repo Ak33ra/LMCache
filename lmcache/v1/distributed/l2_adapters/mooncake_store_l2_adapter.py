@@ -7,6 +7,7 @@ Mooncake Store native L2 adapter config and factory.
 from __future__ import annotations
 
 # Standard
+from copy import copy
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -87,6 +88,29 @@ class MooncakeStoreL2AdapterConfig(L2AdapterConfigBase):
         )
         self.setup_config: dict[str, str] = dict(setup_config)
         self.partition_controls = partition_controls
+
+    def for_partition(self, sdk_scratch_bytes: int) -> "MooncakeStoreL2AdapterConfig":
+        """Enable the strict CPU capability without mutating the caller's config.
+
+        Requires TCP, no setup-time shared segment, and an explicit decimal
+        local buffer size matching the reserved SDK backing. Native startup
+        additionally checks the fenced SDK and strict transport environment.
+
+        Raises:
+            ValueError: Setup bypasses partition ownership or scratch accounting.
+        """
+        if self.setup_config.get("protocol") != "tcp":
+            raise ValueError("Partition Mooncake requires protocol=tcp")
+        if self.setup_config.get("global_segment_size") != "0":
+            raise ValueError("Partition Mooncake requires global_segment_size=0")
+        if self.setup_config.get("local_buffer_size") != str(sdk_scratch_bytes):
+            raise ValueError(
+                "Mooncake local_buffer_size must equal partition sdk_scratch_bytes"
+            )
+        result = copy(self)
+        result.setup_config = dict(self.setup_config)
+        result.partition_controls = True
+        return result
 
     @classmethod
     def from_dict(cls, d: dict[str, object]) -> "MooncakeStoreL2AdapterConfig":

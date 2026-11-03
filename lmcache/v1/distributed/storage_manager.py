@@ -5,6 +5,7 @@ Distributed multi-tier storage manager for MP mode
 
 # Standard
 from collections import defaultdict
+from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from typing import Any, Iterator, Optional, cast
@@ -30,9 +31,11 @@ from lmcache.v1.distributed.config import (
     StorageManagerConfig,
     requires_single_l1_memory_region,
     unwrap_l2_adapter_config,
+    validate_storage_manager_config,
 )
 from lmcache.v1.distributed.error import L1Error, L1ReconfigureError, strerror
 from lmcache.v1.distributed.internal_api import (
+    L1AdmissionLimits,
     L1ManagerInterface,
     L1MemoryDesc,
     L1OperationResult,
@@ -46,6 +49,7 @@ from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import AdapterUsage, L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
+    L2AdaptersConfig,
     get_type_name_for_config,
 )
 from lmcache.v1.distributed.l2_adapters.reconfiguration import (
@@ -54,6 +58,14 @@ from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2ReconfigureError,
 )
 from lmcache.v1.distributed.l2_adapters.serde_wrapper import SerdeL2AdapterWrapper
+from lmcache.v1.distributed.memory_manager.segmented_dram import (
+    SegmentedDRAML1MemoryManager,
+)
+from lmcache.v1.distributed.partition_manager import (
+    PartitionManager,
+    PartitionStatus,
+    ResizeStatus,
+)
 from lmcache.v1.distributed.quota_manager import QuotaManager
 from lmcache.v1.distributed.serde import create_serde_processor
 from lmcache.v1.distributed.storage_controllers import (
@@ -66,7 +78,11 @@ from lmcache.v1.distributed.storage_controllers import (
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     create_prefetch_policy,
 )
+from lmcache.v1.distributed.storage_controllers.store_controller import (
+    StoreAdmissionResult,
+)
 from lmcache.v1.distributed.storage_controllers.store_policy import (
+    ExplicitStorePolicy,
     create_store_policy,
 )
 from lmcache.v1.distributed.storage_controllers.utils import (
@@ -102,6 +118,10 @@ _L1_WRITE_TAG = "storage_manager"
 L1WriteCompletion = list[tuple[int, list[ObjectKey]]]
 
 
+# Failed native cleanup must keep caller-owned mappings alive until process exit.
+_failed_partition_starts: list["StorageManager"] = []
+
+
 class StorageManager:
     def __init__(
         self,
@@ -123,6 +143,24 @@ class StorageManager:
             ValueError: Manager identities/tags, placement, backing storage, or
                 affinity settings conflict.
         """
+        validate_storage_manager_config(config)
+        self._partition_manager: PartitionManager | None = None
+        self._partition_store_lock = threading.Lock()
+        self._partition_stores: set[Future[StoreAdmissionResult]] = set()
+        partition_pool: SegmentedDRAML1MemoryManager | None = None
+        if config.partition is not None:
+            if _l1_managers is not None or _write_policy is not None:
+                raise ValueError("Partitioning owns its L1 topology and write policy")
+            config = replace(
+                config,
+                l2_adapter_config=L2AdaptersConfig(
+                    [
+                        config.l2_adapter_config.adapters[0].for_partition(
+                            config.partition.sdk_scratch_bytes
+                        )
+                    ]
+                ),
+            )
         with ExitStack() as cleanup:
             if _l1_managers is not None:
                 if not _l1_managers or len(
@@ -149,8 +187,21 @@ class StorageManager:
                         raise ValueError(
                             f"Device-DAX path already owned by an L1: {path}"
                         )
-                    manager: L1ManagerInterface = L1Manager(manager_config)
-                    cleanup.callback(manager.close)
+                    if config.partition is None:
+                        manager: L1ManagerInterface = L1Manager(manager_config)
+                    else:
+                        partition_pool = SegmentedDRAML1MemoryManager()
+                        partition_pool.add_segment(config.partition.staging_bytes)
+                        try:
+                            manager = L1Manager(
+                                manager_config,
+                                memory_manager=partition_pool,
+                                admission_limits=L1AdmissionLimits(0, 0),
+                            )
+                        except Exception:
+                            partition_pool.close()
+                            raise
+                    cleanup.callback(self._close_l1_after_partition, manager)
                     created.append(manager)
                 managers = tuple(created)
             self._l1_configs = (
@@ -264,7 +315,11 @@ class StorageManager:
                     manager,
                     [self._l2_adapters[d.index] for d in descriptors],
                     descriptors,
-                    create_store_policy(config.store_policy),
+                    (
+                        ExplicitStorePolicy()
+                        if config.partition is not None
+                        else create_store_policy(config.store_policy)
+                    ),
                 )
                 self._store_controllers[manager.l1_manager_id] = controller
                 controller.start()
@@ -278,11 +333,28 @@ class StorageManager:
                 ],
                 l2_adapters=list(self._l2_adapters.values()),
                 adapter_descriptors=list(self._adapter_descriptors.values()),
-                policy=create_prefetch_policy(config.prefetch_policy),
+                policy=create_prefetch_policy(
+                    "retain" if config.partition is not None else config.prefetch_policy
+                ),
                 inflight_watermark=config.prefetch_inflight_watermark,
             )
             self._prefetch_controller.start()
             cleanup.callback(self._prefetch_controller.stop)
+
+            if config.partition is not None:
+                controls = self._l2_adapters[0].get_capacity_controls()
+                if controls is None:
+                    raise ValueError("Shared adapter has no physical capacity controls")
+                assert partition_pool is not None
+                self._partition_manager = PartitionManager(
+                    config.partition,
+                    partition_pool,
+                    self._l1_manager,
+                    controls,
+                    quiesce=self._partition_quiescent,
+                )
+                cleanup.callback(self._partition_manager.close)
+                self._partition_manager.initialize()
 
             # L2 usage gauge — one observation per adapter, tagged by
             # ``l2_name``.  Parallel to L1Manager's ``l1_memory_usage_bytes``.
@@ -385,60 +457,73 @@ class StorageManager:
             ValueError: Keys repeat.
             Exception: Allocation fails; earlier reservations are discarded.
         """
-        if len(set(keys)) != len(keys):
-            raise ValueError("Repeated keys in write operation reservation")
-        operations: dict[ObjectKey, L1WriteOperation] = {}
-        pending = keys
-        completed = False
-        try:
-            for manager in self._write_managers:
-                if not pending:
-                    break
-                results = manager.reserve_write_operations(
-                    pending,
-                    [L1WriteRetention.RETAIN] * len(pending),
-                    layout_desc,
-                    tag=_L1_WRITE_TAG,
-                )
-                operations.update(
-                    (key, handle)
-                    for key, (_, handle) in results.items()
-                    if handle is not None
-                )
-                pending = [k for k in pending if results[k][0] == L1Error.OUT_OF_MEMORY]
-            self._event_bus.publish(
-                Event(
-                    event_type=EventType.SM_WRITE_RESERVED,
-                    metadata={
-                        "succeeded_keys": list(operations),
-                        "failed_keys": [k for k in keys if k not in operations],
-                    },
-                )
-            )
-            if pending:
+        gate = (
+            self._partition_manager.admission()
+            if self._partition_manager is not None
+            else nullcontext(True)
+        )
+        with gate as admitted:
+            if not admitted:
+                return {}
+            retention = L1WriteRetention.RETAIN
+            if self._partition_uses_shared():
+                retention = L1WriteRetention.TEMPORARY
+            if len(set(keys)) != len(keys):
+                raise ValueError("Repeated keys in write operation reservation")
+            operations: dict[ObjectKey, L1WriteOperation] = {}
+            pending = keys
+            completed = False
+            try:
+                for manager in self._write_managers:
+                    if not pending:
+                        break
+                    results = manager.reserve_write_operations(
+                        pending,
+                        [retention] * len(pending),
+                        layout_desc,
+                        tag=_L1_WRITE_TAG,
+                    )
+                    operations.update(
+                        (key, handle)
+                        for key, (_, handle) in results.items()
+                        if handle is not None
+                    )
+                    pending = [
+                        k for k in pending if results[k][0] == L1Error.OUT_OF_MEMORY
+                    ]
                 self._event_bus.publish(
                     Event(
-                        event_type=EventType.L1_ALLOCATION_FAILED,
-                        metadata={"during": "l1_store", "keys": pending},
+                        event_type=EventType.SM_WRITE_RESERVED,
+                        metadata={
+                            "succeeded_keys": list(operations),
+                            "failed_keys": [k for k in keys if k not in operations],
+                        },
                     )
                 )
-            if is_tracing_enabled() and not self.is_multi_l1 and operations:
-                publish_call_event(
-                    "lmcache.v1.distributed.storage_manager.StorageManager.reserve_write_operations",
-                    {"keys": list(operations), "layout_desc": layout_desc},
-                )
-            completed = True
-            return operations
-        finally:
-            if not completed:
-                self.finish_write_operations(operations, written_keys=frozenset())
+                if pending:
+                    self._event_bus.publish(
+                        Event(
+                            event_type=EventType.L1_ALLOCATION_FAILED,
+                            metadata={"during": "l1_store", "keys": pending},
+                        )
+                    )
+                if is_tracing_enabled() and not self.is_multi_l1 and operations:
+                    publish_call_event(
+                        "lmcache.v1.distributed.storage_manager.StorageManager.reserve_write_operations",
+                        {"keys": list(operations), "layout_desc": layout_desc},
+                    )
+                completed = True
+                return operations
+            finally:
+                if not completed:
+                    self.finish_write_operations(operations, written_keys=frozenset())
 
     def finish_write_operations(
         self,
         operations: dict[ObjectKey, L1WriteOperation],
         *,
         written_keys: frozenset[ObjectKey],
-    ) -> None:
+    ) -> bool:
         """Publish completed writes and discard exact unwritten allocations.
 
         Args:
@@ -448,11 +533,46 @@ class StorageManager:
         Raises:
             ValueError: A key is outside the reservation or a handle is invalid.
 
+        Returns:
+            Whether every written key reached its selected admission target.
+            A shared admission timeout returns False but retains native ownership.
+
         Call only after synchronous copies or confirmed transfer completion.
         No serving read locks are added by store admission.
         """
         if not written_keys.issubset(operations):
             raise ValueError("Written keys are outside the reservation")
+        if self._partition_uses_shared():
+            unwritten = [
+                op for key, op in operations.items() if key not in written_keys
+            ]
+            self._l1_manager.finish_write_operations(
+                unwritten, discard=frozenset(unwritten), read_locks=0
+            )
+            written = {key: op for key, op in operations.items() if key in written_keys}
+            if not written:
+                return True
+            try:
+                completion = self._store_controller.submit_staged_write_operations(
+                    written, adapter_id=0
+                )
+            except (RuntimeError, ValueError):
+                self._l1_manager.finish_write_operations(
+                    list(written.values()),
+                    discard=frozenset(written.values()),
+                    read_locks=0,
+                )
+                logger.exception("Shared admission rejected before ownership transfer")
+                return False
+            with self._partition_store_lock:
+                self._partition_stores.add(completion)
+            completion.add_done_callback(self._retire_partition_store)
+            try:
+                result = completion.result(timeout=30)
+            except TimeoutError:
+                logger.warning("Shared admission remains pending after 30 seconds")
+                return False
+            return not result.failed_keys
         groups: dict[int, list[L1WriteOperation]] = defaultdict(list)
         for handle in operations.values():
             if handle.manager_id not in self._l1_managers_by_id:
@@ -479,6 +599,7 @@ class StorageManager:
                 },
             )
         )
+        return True
 
     @contextmanager
     def read_prefetched_operations(
@@ -800,7 +921,23 @@ class StorageManager:
             ``allowed_l2_memory_tags``) is served from L1 only, and its result
             is available as soon as this returns.
         """
-        prefetch_request_id = self._prefetch_controller.submit_prefetch_request(spec)
+        gate = (
+            self._partition_manager.admission()
+            if self._partition_manager is not None
+            else nullcontext(True)
+        )
+        with gate as admitted:
+            if not admitted:
+                prefetch_request_id = -1
+            else:
+                if (
+                    self._partition_manager is not None
+                    and not self._partition_uses_shared()
+                ):
+                    spec = replace(spec, allowed_l2_memory_tags=frozenset())
+                prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
+                    spec
+                )
         logger.debug(
             "Prefetch request submitted: %d keys in %d groups "
             "(external_request_id=%s, prefetch_request_id=%d, "
@@ -1114,6 +1251,8 @@ class StorageManager:
                 mapped by L2 (409), or the request cannot be applied.
             ValueError: This legacy operation requires a single L1 manager.
         """
+        if self._partition_manager is not None:
+            raise ValueError("Partition topology changes require /partition/resize")
         self._require_single_l1()
         with self._lifecycle_lock:
             # Report the L1 backing error before adapter compatibility.
@@ -1172,6 +1311,8 @@ class StorageManager:
                 transition.
             ValueError: This legacy operation requires a single L1 manager.
         """
+        if self._partition_manager is not None:
+            raise ValueError("Partition topology changes require /partition/resize")
         self._require_single_l1()
         target_was_active = self._l1_devdax_arena_is_active(
             device_path, offset_in_bytes
@@ -1324,6 +1465,8 @@ class StorageManager:
         Returns:
             JSON-serializable operation result.
         """
+        if self._partition_manager is not None:
+            raise ValueError("Partition topology changes require /partition/resize")
         with self._lifecycle_lock if operation in ("add", "resize") else nullcontext():
             adapter = self._get_reconfigurable_l2_adapter(adapter_index)
             result = adapter.reconfigure(
@@ -1353,6 +1496,8 @@ class StorageManager:
                 Device-DAX arena), or a DAX device is already mapped by L1 or
                 another L2 adapter.
         """
+        if self._partition_manager is not None:
+            raise ValueError("Partition topology changes require /partition/resize")
         with self._lifecycle_lock:
             # Mirror of the check in add_l1_devdax_device: a single-region
             # adapter may only be added while L1 is exactly one memory region.
@@ -1407,6 +1552,8 @@ class StorageManager:
                 the adapter is left active (draining) so the caller can
                 retry.
         """
+        if self._partition_manager is not None:
+            raise ValueError("Partition topology changes require /partition/resize")
         with self._lifecycle_lock:
             if adapter_id not in self._l2_adapters:
                 raise ValueError(f"No L2 adapter with id {adapter_id}")
@@ -1465,6 +1612,29 @@ class StorageManager:
         for manager in self._l1_managers_by_id.values():
             manager.clear(force=force)
 
+    @property
+    def partition_enabled(self) -> bool:
+        """Whether the verified partition topology owns this storage manager."""
+        return self._partition_manager is not None
+
+    def get_partition_status(self) -> PartitionStatus:
+        """Return cached physical ownership without blocking on backend I/O."""
+        if self._partition_manager is None:
+            raise ValueError("Partitioning is disabled")
+        return self._partition_manager.get_status()
+
+    def request_partition_resize(self, request_id: str, alpha: float) -> ResizeStatus:
+        """Submit an idempotent asynchronous resize to the topology owner."""
+        if self._partition_manager is None:
+            raise ValueError("Partitioning is disabled")
+        return self._partition_manager.request_resize(request_id, alpha)
+
+    def get_partition_resize(self, request_id: str) -> ResizeStatus:
+        """Return one request's cached outcome; raise KeyError for an unknown ID."""
+        if self._partition_manager is None:
+            raise ValueError("Partitioning is disabled")
+        return self._partition_manager.resize_status(request_id)
+
     def close(self):
         """
         Close the storage manager and release all resources.
@@ -1478,6 +1648,8 @@ class StorageManager:
 
         PeriodicEventNotifier.shutdown()
 
+        if self._partition_manager is not None and not self._partition_manager.close():
+            raise RuntimeError("Partition cleanup retained ownership; retry close")
         for adapter in self._l2_adapters.values():
             adapter.close()
 
@@ -1528,6 +1700,7 @@ class StorageManager:
             "l2_eviction_controller": l2_eviction,
             "l2_adapters": adapters,
             "num_l2_adapters": len(adapters),
+            "partition_enabled": self.partition_enabled,
             "l1_usage": self.get_l1_usage(),
             "l1_capacity_bytes_by_backend": dict(capacities),
         }
@@ -1836,3 +2009,28 @@ class StorageManager:
         if adapter_index < 0 or adapter_index >= len(adapters):
             raise L2ReconfigureError(404, "L2 adapter not reconfigurable")
         return adapters[adapter_index][1]
+
+    def _partition_uses_shared(self) -> bool:
+        if self._partition_manager is None:
+            return False
+        current = self._partition_manager.get_status().current
+        return current is not None and current.shared_effective_bytes > 0
+
+    def _partition_quiescent(self) -> bool:
+        with self._partition_store_lock:
+            pending_stores = bool(self._partition_stores)
+        return not pending_stores and not self._prefetch_controller.has_pending_work()
+
+    def _retire_partition_store(self, completion: Future[StoreAdmissionResult]) -> None:
+        with self._partition_store_lock:
+            self._partition_stores.discard(completion)
+
+    def _close_l1_after_partition(self, manager: L1ManagerInterface) -> None:
+        if self._partition_manager is not None:
+            if not self._partition_manager.get_status().closed:
+                _failed_partition_starts.append(self)
+                logger.error(
+                    "Failed startup retains partition backing until process exit"
+                )
+                return
+        manager.close()

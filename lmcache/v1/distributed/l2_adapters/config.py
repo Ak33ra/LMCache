@@ -201,6 +201,17 @@ class L2AdapterConfigBase(ABC):
     #:     for async (de)serialize, default ``1``).
     serde_config: SerdeConfig | None = None
 
+    def for_partition(self, sdk_scratch_bytes: int) -> "L2AdapterConfigBase":
+        """Return config enabling verified dynamic physical ownership controls.
+
+        Args:
+            sdk_scratch_bytes: Explicit upper bound for backend scratch backing.
+
+        Raises:
+            ValueError: This backend does not support partition activation.
+        """
+        raise ValueError(f"{type(self).__name__} has no partition capacity controls")
+
     @staticmethod
     def _parse_serde_config(d: dict[str, object]) -> SerdeConfig | None:
         """Parse an optional ``"serde"`` sub-dict from an adapter JSON spec.

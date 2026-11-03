@@ -35,6 +35,7 @@ from lmcache.v1.multiprocess.transfer_context.tensor_wire import (
     decode_tensors,
     encode_tensors,
 )
+from lmcache.v1.multiprocess.transport.request_limits import RequestLimits
 
 LAYOUT = MemoryLayoutDesc([torch.Size([1024])], [torch.float32])
 KEY = ObjectKey(ObjectKey.IntHash2Bytes(1), "inline-lifetime", 0)
@@ -293,3 +294,56 @@ def test_inline_reads_follow_exact_multi_l1_owners() -> None:
         assert store.get_l1_usage()[0] == 0
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("direction", ["store", "retrieve"])
+def test_bounded_inline_rejects_workspace_before_tensor_copy(
+    storage: tuple[StorageManager, L1Manager],
+    monkeypatch: pytest.MonkeyPatch,
+    direction: str,
+) -> None:
+    """Excess copy workspace is refused without leaking an exact operation."""
+    store, manager = storage
+    payload = encode_tensors([torch.ones(1024)])
+    if direction == "retrieve":
+        assert InlineTransferStrategy(store).commit_store(
+            IPC_KEY, 1, payload, CONTEXT, lambda _: [KEY]
+        )
+        manager.reserve_read([KEY])
+    strategy = InlineTransferStrategy(
+        store, request_limits=RequestLimits(8192, 1, 4096)
+    )
+    copied = []
+
+    def unexpected_copy(
+        tensor: torch.Tensor, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        copied.append(tensor.numel())
+        raise AssertionError("copy started before workspace validation")
+
+    monkeypatch.setattr(
+        torch.Tensor, "copy_" if direction == "store" else "clone", unexpected_copy
+    )
+    with pytest.raises(ValueError, match="workspace"):
+        if direction == "store":
+            strategy.commit_store(IPC_KEY, 1, payload, CONTEXT, lambda _: [KEY])
+        else:
+            strategy.prepare_retrieve(IPC_KEY, 1, lambda _: [KEY])
+    assert not copied
+    status = manager.report_status()
+    assert status["active_write_operation_count"] == 0
+    assert status["active_read_operation_count"] == 0
+
+
+def test_bounded_inline_refused_reservation_does_not_acknowledge_store(
+    storage: tuple[StorageManager, L1Manager],
+) -> None:
+    """A full pool cannot turn an empty reservation into successful admission."""
+    store, _manager = storage
+    strategy = InlineTransferStrategy(
+        store, request_limits=RequestLimits(8192, 1, 32768)
+    )
+    payload = encode_tensors([torch.ones(1024)])
+    assert strategy.commit_store(IPC_KEY, 1, payload, CONTEXT, lambda _: [KEY])
+    assert not strategy.commit_store(IPC_KEY, 1, payload, CONTEXT, lambda _: [OTHER])
+    assert store.get_l1_usage() == (4096, 4096)

@@ -64,6 +64,7 @@ from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
 )
 from lmcache.v1.multiprocess.modules.management import ManagementModule
 from lmcache.v1.multiprocess.transport.base import RequestServer
+from lmcache.v1.multiprocess.transport.request_limits import RequestLimits
 from lmcache.v1.multiprocess.transport.server_factory import create_request_server
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.ipc_policy import set_isolated_ipc
@@ -299,6 +300,30 @@ def run_cache_server(
         If return_engine is True: tuple of (request server, MPCacheServer).
         If return_engine is False: None (blocks until interrupted).
     """
+    if storage_manager_config.partition is not None:
+        if (
+            torch_device_type != "cpu"
+            or mp_config.transport != "zmq"
+            or mp_config.supported_transfer_mode != "engine_driven"
+            or mp_config.shm_name != ""
+            or mp_config.engine_type != "default"
+            or mp_config.p2p_config.enabled
+            or mp_config.server_modules
+            or mp_config.runtime_plugin_config.locations
+            or mp_config.run_script_api_enabled
+            or obs_config.trace_level is not None
+        ):
+            raise ValueError(
+                "Partitioning requires CPU, ZMQ, engine_driven typed-inline "
+                "transfer, empty shm_name, and the default engine without "
+                "P2P, extensions, run_script or storage trace capture"
+            )
+        mp_config.request_limits = RequestLimits(
+            max_payload_bytes=8 << 20,
+            max_inflight_requests=4,
+            max_workspace_bytes=32 << 20,
+        )
+
     # Before any event IPC backend is resolved (KV-cache registration), so
     # the setting is observed by every resolver in this process.
     set_isolated_ipc(mp_config.isolated_ipc)

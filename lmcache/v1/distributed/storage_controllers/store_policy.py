@@ -149,6 +149,16 @@ class DefaultStorePolicy(StorePolicy):
         return []
 
 
+class ExplicitStorePolicy(DefaultStorePolicy):
+    """Keep resident copies local; only explicit staged admission exports KV."""
+
+    def select_store_targets(
+        self, keys: list[ObjectKey], adapters: list[L2AdapterDescriptor]
+    ) -> dict[int, list[ObjectKey]]:
+        """Never export published or promoted L1 copies automatically."""
+        return {}
+
+
 class BufferOnlyStorePolicy(DefaultStorePolicy):
     """
     Buffer-only store policy: store all keys to all adapters,

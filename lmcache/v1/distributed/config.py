@@ -23,6 +23,7 @@ from lmcache.v1.distributed.l2_adapters.config import (
     get_type_name_for_config,
     parse_args_to_l2_adapters_config,
 )
+from lmcache.v1.distributed.partition_config import PartitionConfig
 from lmcache.v1.platform import current_device_spec
 
 logger = init_logger(__name__)
@@ -678,6 +679,9 @@ class StorageManagerConfig:
     )
     """ The configuration for L2 adapters. """
 
+    partition: PartitionConfig | None = None
+    """Opt-in physical private/shared partitioning for the typed-inline CPU path."""
+
     store_policy: str = "default"
     """ The L2 store policy name. """
 
@@ -760,6 +764,34 @@ def validate_storage_manager_config(config: StorageManagerConfig) -> None:
         ValueError: If mutually exclusive L1 tiers are both configured, or
             hybrid L1 is paired with incompatible L2 adapters.
     """
+    if config.partition is not None:
+        if len(config.l1_manager_configs) != 1:
+            raise ValueError("Partitioning requires exactly one segmented DRAM L1")
+        l1 = config.l1_manager_config
+        memory = l1.memory_config
+        if (
+            l1.gds_l1_config is not None
+            or memory.use_lazy
+            or memory.shm_name
+            or memory.use_hugepages
+            or memory.mlock
+            or memory.devdax_path
+            or memory.size_in_bytes != config.partition.staging_bytes
+            or memory.align_bytes != mmap.PAGESIZE
+        ):
+            raise ValueError(
+                "Partition L1 must start with staging_bytes of page-aligned, "
+                "eager CPU DRAM without SHM, hugepages, mlock or DAX"
+            )
+        if len(config.l2_adapter_config.adapters) != 1:
+            raise ValueError("Partitioning requires exactly one shared L2 adapter")
+        adapter = config.l2_adapter_config.adapters[0]
+        if adapter.serde_config is not None or adapter.eviction_config is not None:
+            raise ValueError("Partitioning excludes L2 serde and LMCache L2 eviction")
+        adapter.for_partition(config.partition.sdk_scratch_bytes)
+        if config.store_policy != "default" or config.prefetch_policy != "default":
+            raise ValueError("Partitioning owns store and prefetch policy selection")
+
     by_tag = {c.tag: c for c in config.l1_manager_configs}
     shm_names = [
         c.memory_config.shm_name
@@ -845,6 +877,13 @@ def add_storage_manager_args(
             "Tagged L1 JSON: type (DRAM, DEVDAX, GDS), tag, size_gb "
             "and backend fields. Repeat for multiple L1s."
         ),
+    )
+    parser.add_argument(
+        "--kv-partition",
+        metavar="JSON",
+        default=None,
+        help="Experimental CPU private/shared budget: total_bytes, staging_bytes, "
+        "sdk_scratch_bytes, alpha. Owns L1 sizes and backing configuration.",
     )
     # L1 Memory Manager Config
     memory_group = parser.add_argument_group(
@@ -1105,6 +1144,40 @@ def parse_args_to_config(
         if args.eviction_policy is not None
         else None
     )
+    raw_partition = getattr(args, "kv_partition", None)
+    if raw_partition is not None:
+        values = json.loads(raw_partition)
+        if not isinstance(values, dict):
+            raise ValueError("--kv-partition requires a JSON object")
+        partition = PartitionConfig.from_dict(values)
+        if (
+            args.l1_size_gb is not None
+            or getattr(args, "l1_manager", [])
+            or args.gds_l1_path is not None
+            or args.l1_devdax_path is not None
+            or getattr(args, "l1_use_hugepages", False)
+            or getattr(args, "shm_name", "")
+            or args.l1_align_bytes != mmap.PAGESIZE
+        ):
+            raise ValueError("--kv-partition owns L1 capacity and backing options")
+        return StorageManagerConfig(
+            l1_manager_config=L1ManagerConfig(
+                memory_config=L1MemoryManagerConfig(
+                    size_in_bytes=partition.staging_bytes,
+                    use_lazy=False,
+                    shm_name="",
+                ),
+                read_ttl_seconds=args.l1_read_ttl_seconds,
+                write_ttl_seconds=args.l1_write_ttl_seconds,
+            ),
+            eviction_config=defaults or EvictionConfig("LRU"),
+            l2_adapter_config=parse_args_to_l2_adapters_config(args),
+            partition=partition,
+            store_policy=args.l2_store_policy,
+            prefetch_policy=args.l2_prefetch_policy,
+            prefetch_inflight_watermark=args.l2_prefetch_inflight_watermark,
+            periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
+        )
     raw_configs = getattr(args, "l1_manager", [])
     if raw_configs:
         if (

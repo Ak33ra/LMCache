@@ -26,6 +26,7 @@ from lmcache.v1.multiprocess.transfer_context.tensor_wire import (
     encode_grouped_tensors,
     encode_tensors,
 )
+from lmcache.v1.multiprocess.transport.request_limits import RequestLimits
 
 if TYPE_CHECKING:
     # First Party
@@ -51,6 +52,7 @@ def create_transfer_strategy(
     transfer_key_factory: Callable[
         [IPCCacheServerKey, int], tuple[int, IPCCacheServerKey]
     ],
+    request_limits: RequestLimits | None = None,
 ) -> "TransferStrategy":
     """Create the non-GPU transfer strategy for a registered context.
 
@@ -77,12 +79,12 @@ def create_transfer_strategy(
             pending_lock=pending_lock,
             transfer_key_factory=transfer_key_factory,
             fallback_strategy=InlineTransferStrategy(
-                storage_manager, read_owner_resolver
+                storage_manager, read_owner_resolver, request_limits
             ),
         )
 
     logger.info("Using safe inline engine-driven transfer strategy")
-    return InlineTransferStrategy(storage_manager, read_owner_resolver)
+    return InlineTransferStrategy(storage_manager, read_owner_resolver, request_limits)
 
 
 class TransferStrategy(abc.ABC):
@@ -202,12 +204,14 @@ class InlineTransferStrategy(TransferStrategy):
         self,
         storage_manager: "StorageManager",
         read_owner_resolver: Callable[[str], dict[ObjectKey, int] | None] | None = None,
+        request_limits: RequestLimits | None = None,
     ) -> None:
         """Initialize the safe inline transfer strategy.
 
         Args:
             storage_manager: Storage manager used for reserve/read/finish calls.
         """
+        self._request_limits = request_limits
         self._storage_manager = storage_manager
         self._read_owner_resolver = read_owner_resolver
 
@@ -284,11 +288,16 @@ class InlineTransferStrategy(TransferStrategy):
                 memory_obj.tensor.copy_(chunk_cpu)
                 written_keys.append(obj_key)
         finally:
-            self._storage_manager.finish_write_operations(
+            admission_succeeded = self._storage_manager.finish_write_operations(
                 operations, written_keys=frozenset(written_keys)
             )
 
-        success = len(written_keys) == len(reserved_dict)
+        expected_count = (
+            len(obj_keys) if self._request_limits is not None else len(reserved_dict)
+        )
+        success = (
+            len(written_keys) == expected_count and admission_succeeded is not False
+        )
         if not success:
             logger.error(
                 "Engine-driven inline store incomplete (instance_id=%d, "
@@ -320,6 +329,9 @@ class InlineTransferStrategy(TransferStrategy):
         Returns:
             ``True`` when every reserved object is written successfully.
         """
+        if self._request_limits is not None:
+            self._request_limits.check_payload_bytes(len(cpu_data))
+            self._request_limits.check_workspace_bytes(3 * len(cpu_data))
         if group_keys is not None and len(group_keys) > 1:
             group_layouts = context.group_layouts
             if group_layouts is None or len(group_layouts) != len(group_keys):
@@ -386,6 +398,7 @@ class InlineTransferStrategy(TransferStrategy):
         )
 
         group_chunks: list[list[torch.Tensor]] = []
+        tensor_bytes = 0
         for g_keys in group_keys:
             with self._storage_manager.read_prefetched_operations(
                 g_keys, l1_owners=owners
@@ -398,6 +411,11 @@ class InlineTransferStrategy(TransferStrategy):
                         return PrepareRetrieveResponse(
                             success=False, data=b"", context={}
                         )
+                    tensor_bytes += (
+                        memory_obj.tensor.numel() * memory_obj.tensor.element_size()
+                    )
+                    if self._request_limits is not None:
+                        self._request_limits.check_workspace_bytes(3 * tensor_bytes)
                     chunks.append(memory_obj.tensor.cpu().clone())
                 group_chunks.append(chunks)
 
@@ -411,6 +429,8 @@ class InlineTransferStrategy(TransferStrategy):
             )
         else:
             data = encode_tensors(group_chunks[0])
+        if self._request_limits is not None:
+            self._request_limits.check_payload_bytes(len(data))
         return PrepareRetrieveResponse(success=True, data=data, context={})
 
     def commit_retrieve(

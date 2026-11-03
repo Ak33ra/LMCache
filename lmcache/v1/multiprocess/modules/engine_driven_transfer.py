@@ -35,6 +35,7 @@ from lmcache.v1.multiprocess.engine_module import (
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMetadata
+from lmcache.v1.multiprocess.transport.request_limits import RequestLimits
 from lmcache.v1.periodic_thread import (
     ThreadLevel,
     ThreadRunSummary,
@@ -95,9 +96,12 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         mode = build_ctx.mp_config.supported_transfer_mode
         if mode == "lmcache_driven":
             return None
-        return cls(build_ctx.engine_context)
+        return cls(build_ctx.engine_context, build_ctx.mp_config.request_limits)
 
-    def __init__(self, ctx: MPCacheServerContext) -> None:
+    def __init__(
+        self, ctx: MPCacheServerContext, request_limits: RequestLimits | None = None
+    ) -> None:
+        self._request_limits = request_limits
         self._ctx = ctx
         self._engine_driven_contexts: dict[int, EngineDrivenContextEntry] = {}
         self._strategies: dict[int, TransferStrategy] = {}
@@ -449,6 +453,7 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             pending_reads=self._pending_shm_reads,
             pending_lock=self._pending_shm_lock,
             transfer_key_factory=self._make_transfer_key,
+            request_limits=self._request_limits,
         )
         with self._lock:
             self._engine_driven_contexts[payload.instance_id] = entry

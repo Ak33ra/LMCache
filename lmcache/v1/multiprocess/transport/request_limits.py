@@ -35,6 +35,11 @@ class RequestLimits:
         ):
             raise ValueError("Request limits must be positive integers")
 
+    def check_payload_bytes(self, total_bytes: int) -> None:
+        """Reject an encoded payload outside the explicit wire-byte bound."""
+        if total_bytes < 0 or total_bytes > self.max_payload_bytes:
+            raise ValueError("Inline payload exceeds request limit")
+
     def check_workspace_bytes(self, total_bytes: int) -> None:
         """Reject an aggregate tensor workspace before allocating its copies.
 
