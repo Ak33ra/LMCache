@@ -221,3 +221,8 @@ The release record follows the copy, preserving the replayed access interval.
 No operation capability or process-local manager ID is serialized. The existing
 multi-L1 replay limitation remains. `test_multi_l1.py` serializes these records
 and dispatches them against a fresh manager through the unchanged dispatcher.
+
+Inline serving converts one current prefetch TTL reservation to an exact read
+operation while holding the L1 lock. An absent or expired reservation cannot
+start a copy. Once acquired, the operation remains valid until the synchronous
+copy ends, regardless of later TTL expiry or session cancellation.

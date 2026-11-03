@@ -323,9 +323,9 @@ class L1ManagerInterface(Protocol):
         ...
 
     def acquire_read_operations(
-        self, keys: list[ObjectKey]
+        self, keys: list[ObjectKey], *, consume_read_lock: bool = False
     ) -> dict[ObjectKey, L1ReadOperationResult]:
-        """Pin each resident allocation until its exact operation completes."""
+        """Pin allocations, optionally converting a current TTL read lock."""
         ...
 
     def finish_read_operations(

@@ -180,6 +180,24 @@ def test_partial_read_miss_releases_acquired_operations(
     assert store.get_l1_usage()[0] == 0
 
 
+@pytest.mark.parametrize("expired", [False, True])
+def test_inline_retrieve_requires_current_prefetch_reservation(
+    storage: tuple[StorageManager, L1Manager], expired: bool
+) -> None:
+    """An expired or absent reservation cannot start a new CPU copy."""
+    store, manager = storage
+    strategy = InlineTransferStrategy(store)
+    assert strategy.commit_store(
+        IPC_KEY, 1, encode_tensors([torch.ones(1024)]), CONTEXT, lambda _: [KEY]
+    )
+    if expired:
+        manager.reserve_read([KEY])
+        time.sleep(1.1)
+    assert manager.unsafe_read([KEY])[KEY][0] == L1Error.KEY_NOT_READABLE
+    assert not strategy.prepare_retrieve(IPC_KEY, 1, lambda _: [KEY]).success
+    assert manager.report_status()["active_read_operation_count"] == 0
+
+
 def test_overflow_allocation_failure_discards_earlier_handles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

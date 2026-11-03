@@ -412,3 +412,10 @@ The complete `test_multi_l1.py` file plus both focused lifetime files passed
 **37 tests, zero skipped** after trace compatibility was added. The separate
 process smoke also passed again. Logs are `/tmp/kvc-serving-trace.log` and
 `/tmp/kvc-serving-smoke-final.log`.
+
+The serving regression selection also rejects starting a retrieve without a
+current prefetch reservation. The two native cases are
+`test_inline_retrieve_requires_current_prefetch_reservation`; both failed
+before the correction and pass after atomic TTL-to-operation conversion.
+The combined inline, read-operation, Store-source, and multi-L1 selection
+passed 46 tests with no skips on 2026-11-03.

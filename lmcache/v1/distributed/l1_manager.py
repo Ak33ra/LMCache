@@ -403,16 +403,19 @@ class L1Manager(L1ManagerInterface):
 
     @l1_mgr_synchronized
     def acquire_read_operations(
-        self, keys: list[ObjectKey]
+        self, keys: list[ObjectKey], *, consume_read_lock: bool = False
     ) -> dict[ObjectKey, L1ReadOperationResult]:
         """Pin resident allocations without a TTL until explicit completion.
 
         Args:
             keys: Resident keys to read; duplicate keys acquire one handle.
+            consume_read_lock: Require and consume one current TTL read lock
+                while pinning the allocation, for prefetched serving reads.
 
         Returns:
             Per-key SUCCESS and a handle, KEY_NOT_EXIST for a missing key, or
             KEY_IS_LOCKED at the per-allocation limit of 128 active operations.
+            KEY_NOT_READABLE if the required TTL reservation is absent/expired.
             The caller must release each handle after all buffer access ends.
         """
         results: dict[ObjectKey, L1ReadOperationResult] = {}
@@ -421,6 +424,8 @@ class L1Manager(L1ManagerInterface):
             entry = self._objects.get(key)
             if entry is None:
                 results[key] = (L1Error.KEY_NOT_EXIST, None)
+            elif consume_read_lock and not entry.read_lock.is_locked():
+                results[key] = (L1Error.KEY_NOT_READABLE, None)
             elif entry.read_operations >= MAX_READ_LOCK_COUNT:
                 results[key] = (L1Error.KEY_IS_LOCKED, None)
             else:
@@ -432,9 +437,12 @@ class L1Manager(L1ManagerInterface):
                     key, entry, handle
                 )
                 entry.read_operations += 1
+                if consume_read_lock:
+                    entry.read_lock.unlock()
                 results[key] = (L1Error.SUCCESS, handle)
                 acquired.append(key)
-        self._report_read_reserved(acquired)
+        if not consume_read_lock:
+            self._report_read_reserved(acquired)
         return results
 
     @l1_mgr_synchronized

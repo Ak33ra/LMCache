@@ -516,12 +516,11 @@ class StorageManager:
                 acquired = {
                     key: handle
                     for key, (_, handle) in manager.acquire_read_operations(
-                        group
+                        group, consume_read_lock=True
                     ).items()
                     if handle is not None
                 }
                 operations.update(acquired)
-                manager.finish_read(list(acquired))
             yield (
                 [operations[key].memory_obj for key in keys]
                 if len(operations) == len(set(keys))
