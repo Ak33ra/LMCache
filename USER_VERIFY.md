@@ -5,6 +5,7 @@ select this checkout without changing the shared editable installation.
 
 ```bash
 source /scratch/akira/lmcache-dev/bin/activate
+unset LD_LIBRARY_PATH
 export PYTHONPATH="$PWD"
 export NUMBA_CACHE_DIR=/tmp/kvc-numba-cache
 export CUDA_VISIBLE_DEVICES=''
@@ -15,6 +16,13 @@ A fresh worktree needs the CPU common native extensions. Build with
 `NO_GPU_EXT=1 python setup.py build_ext --inplace`, or symlink the existing
 `lmcache/*.so` from the same revision and Python ABI. The recorded run used
 symlinks to `/home/akira/kvc-partitioning/LMCache/lmcache/*.so`.
+
+The final CPU partition activation checks are in
+[U-ACTIVATION](#u-activation-cpu-partition-configuration-and-inline-admission).
+Earlier sections preserve dated results for the smaller prerequisite units.
+Their historical Sphinx failures were corrected by `9cd081ad`; the strict
+full build now passes. Live two-server and workload commands are in the outer
+project's `USER_VERIFY.md`.
 
 ## U0a. Native CPU storage contracts
 
@@ -605,7 +613,7 @@ command from U4a was also run with output directory
 base `3744a7e0`, with none for this Markdown-only documentation change. The
 log is `/tmp/kvc-staged-store-docs.log`.
 
-## M4a — native CPU Mooncake ownership controls
+## M4a. Native CPU Mooncake ownership controls
 
 This unit adds opt-in native controls only. It does not enable MP partitioning.
 Build the optional connector against the completed strict CPU TCP fork, then
