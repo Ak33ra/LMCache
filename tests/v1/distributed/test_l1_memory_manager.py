@@ -26,7 +26,7 @@ import pytest
 import torch
 
 # First Party
-from lmcache import torch_dev, torch_device_type
+from lmcache import lmcache_native, torch_dev, torch_device_type
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.config import (
     HUGEPAGE_SIZE_BYTES,
@@ -45,6 +45,9 @@ try:
 except ImportError:
     # Skip the tests if the L1MemoryManager cannot be imported
     pytest.skip("L1MemoryManager could not be imported", allow_module_level=True)
+
+if not getattr(lmcache_native, "__file__", None):
+    pytest.skip("Requires compiled lmcache_native extension", allow_module_level=True)
 
 if torch_device_type != "cpu" and not torch_dev.is_available():
     pytest.skip(
