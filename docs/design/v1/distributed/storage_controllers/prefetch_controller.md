@@ -20,17 +20,18 @@ The request's lock state is exactly three maps, all on `PrefetchKeyState`:
 | `l2_locked_keys` | L2 adapter | Cells that adapter holds locked for this request. |
 | `l1_reserved_keys` | L1 manager | Cells with a staging buffer reserved for an L2 load. |
 
-The maps are consistent after every step of the flow. Abort and shutdown
-release exactly what the maps record, so any step can fail and the request
-leaves nothing behind.
+The maps record planning and locks. `write_operations` also records exact
+allocation capabilities, per L1 manager and key. Abort and shutdown release
+idle resources and keep destinations owned until every accepted adapter task
+ends local access. An uncertain submission retains its own destinations.
 
 ## Invariants
 
 - **Observation is acquisition.** L1 is probed by read-locking it
   (`reserve_read`); L2 is probed by `lookup_and_lock`. A key required for the
-  reported hit is lock-held from the moment it is discovered until the request
-  finishes, so a concurrent eviction can shrink what gets discovered but never
-  invalidate a reported hit.
+  reported hit has serving TTL locks. These locks can expire during a long
+  request; they do not establish operation ownership for subsequent serving
+  reads. Destination writes use separate non-expiring allocation capabilities.
 - **One planning step, one fold.** The policy plans once on the union of the
   L1 locked map and every L2 locked map. The prefix fold runs once, at finish,
   over the final L1 locked map. L1 is never folded on its own and then handed
@@ -64,7 +65,7 @@ submit_prefetch_request(spec: PrefetchTaskSpec) -> PrefetchRequestId
 query_prefetch_result(request_id) -> PrefetchResult | None   # consume-once
 wait_prefetch_result(request_id, timeout) -> bool            # does not consume
 add_adapter(adapter_id, adapter, descriptor) / request_remove_adapter(adapter_id)
-start() / stop()
+start() / stop(timeout=30.0)
 ```
 
 `submit_prefetch_request` is thread-safe. When the spec allows no L2 adapter
@@ -133,19 +134,20 @@ afterwards.
    every L1 lock and every L2 lock outside the plan, then set both locked maps
    to the plan.
 4. **Reserve** (`_transition_to_load_phase`). For each L2 adapter in the plan,
-   `reserve_write` staging buffers in its affinity L1 manager under a
-   per-request write tag, with retention decided per key by
+   `reserve_write_operations` staging buffers in its affinity L1 manager under
+   a per-request write tag, with retention decided per key by
    `policy.plan_l1_retention` (every key is retained under `NO_LOCK`).
    Reservation failure is **per cell**: `L2_PREFETCH_FAILED` is published with
    reason `l1_oom` or `l1_contended`, the affected L2 locks are returned, and
    the request is re-planned on what was reserved. Staging buffers the replan
-   drops are deleted (`finish_write_and_delete`).
+   drops complete with `finish_write_operations(..., discard=...)` before
+   submission.
 5. **Load** (`_submit_load_tasks`). One load task per adapter in the plan,
    carrying the reserved buffers.
 6. **Admit** (`_poll_load_results`), per adapter as its result arrives. Loaded
-   keys go through `finish_write_and_reserve_read` and join `l1_locked_keys`
-   and the request's `l2_loaded_cells`; failed keys are deleted
-   (`finish_write_and_delete`, `L2_PREFETCH_FAILED` reason `not_found`); the
+   keys go through `finish_write_operations` and join `l1_locked_keys`
+   and the request's `l2_loaded_cells`; failed handles complete with `discard`
+   (`L2_PREFETCH_FAILED` reason `not_found`); the
    adapter's L2 locks are returned and its entries leave `l2_locked_keys` and
    `l1_reserved_keys`.
 7. **Finish** (`_finish_request`), once no load task is outstanding. Fold the
@@ -171,11 +173,30 @@ Under `NO_LOCK` the finish row releases every L1 lock; loaded objects stay
 resident and evictable. Under `full` fetching there is no fold: every locked
 cell is a hit cell.
 
-**Errors.** Any exception while advancing a request aborts it
-(`_abort_request`): the three maps are walked to return L2 locks, delete
-staging buffers and release L1 read locks, an all-zero result is published,
-and the request is retired. `stop()` does the same for every in-flight
-request. Outstanding adapter tasks are left to complete on their own.
+**Errors and shutdown.** Abort publishes an all-zero result and releases idle
+resources. Destinations belonging to known load tasks stay pinned until
+`query_load_result` returns non-None. Aborted loads discard their destinations
+after completion, even when the adapter reports success. Their L2 locks remain
+held through local access. The request retires after known tasks drain.
+
+`stop(timeout=30.0)` rejects new submissions, cancels pending requests, and
+drains existing tasks. A timeout raises `TimeoutError`; the background loop
+continues draining, allocations stay charged, and the caller can retry stop.
+Neither cancellation nor TTL expiry permits freeing an active destination.
+
+Before calling an adapter's submit method the request records which adapter
+may accept the buffers. If submission raises without returning a task ID, the
+controller cannot establish rejection. It stops further admission and keeps
+that adapter's exact destinations quarantined. Earlier accepted tasks still
+drain; unsubmitted destinations are released. `stop()` raises `RuntimeError`
+once known work drains. `requires_process_exit`, `unresolved_submission_count`,
+and `unresolved_write_operation_count` expose this bounded failure state.
+No completion tombstones accumulate.
+
+The adapter completion contract covers **local destination buffer access**,
+including failed loads. It does not prove remote-segment or transport drain.
+Successful admission atomically replaces operation ownership with serving TTL
+read locks, whose expiry behavior remains unchanged.
 
 ## Policy
 
@@ -244,7 +265,15 @@ with a real `L1Manager` and `MockL2Adapter`:
 - `TestSlidingWindowRows` — a windowed row keeps and loads only its trailing
   chunks; `"full"` refuses windowed rows.
 - `TestRuntimeAdapters`, `TestShutdown` — draining adapters are not planned
-  and detach once unreferenced; `stop()` releases what the maps record.
+  and detach once unreferenced; `stop()` drains tasks before releasing buffers.
 
 `tests/v1/distributed/test_prefetch_policy.py` tests the policies black-box
 against their docstrings.
+
+
+`tests/v1/distributed/test_prefetch_write_operations.py` uses controlled
+Python adapters with real native CPU allocations. It delays writes beyond TTL,
+checks unpublished destinations and terminal failures, proves timeout/drain
+retry, and isolates ambiguous submissions in disposable processes. Its
+multi-adapter case separates accepted, uncertain, and unsubmitted ownership.
+These are controller regressions, not native Store transport evidence.

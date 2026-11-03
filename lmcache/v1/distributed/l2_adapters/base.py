@@ -352,6 +352,12 @@ class L2AdapterInterface(ABC):
         is a bitmap indicating the success or failure of each key-object pair in
         the task.
 
+        A non-None result certifies that every local destination buffer access
+        has ended, including failed objects. The caller may publish successful
+        destinations and release failed ones only after this result. A timeout,
+        cancellation request, or submit exception is not this certificate. This
+        contract does not establish remote-segment or transport quiescence.
+
         For a single task id, this function will ONLY return a non-None value ONCE.
         (Which means this function is not idempotent)
 

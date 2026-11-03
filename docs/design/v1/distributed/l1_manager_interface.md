@@ -21,6 +21,11 @@ without changes on the caller side.
   Invalid completion capabilities raise `ValueError` without partially
   releasing a batch. Their allocation ownership is independent of session
   TTLs; see [the lifetime contract](l1_manager.md#explicit-allocation-read-operations).
+- Explicit destinations use `reserve_write_operations` and
+  `finish_write_operations`. Prefetch holds these immutable capabilities until
+  adapters end local buffer access. Successful completion atomically admits
+  serving reads; failed completion discards the exact destination. See
+  [write ownership](l1_manager.md#explicit-destination-write-operations).
 - It is `runtime_checkable`; `L1Manager` declares it explicitly
   (`class L1Manager(L1ManagerInterface)`) so the contract is visible at the
   implementation site, not only at the call sites.
