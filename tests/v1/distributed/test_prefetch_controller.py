@@ -66,7 +66,7 @@ from lmcache.v1.distributed.storage_controllers.utils import (
 from lmcache.v1.memory_management import MemoryObjMetadata, TensorMemoryObj
 from tests.v1.distributed.utils import should_use_lazy_alloc
 
-if not torch_dev.is_available():
+if torch_device_type != "cpu" and not torch_dev.is_available():
     pytest.skip(
         f"Requires available {torch_device_type} runtime",
         allow_module_level=True,
@@ -140,7 +140,8 @@ def make_l1_config(
     """Create an L1 manager config of the given capacity.
 
     A non-lazy pool enforces ``size_in_bytes`` exactly; the default follows
-    the platform's preferred allocation mode.
+    the platform's preferred allocation mode. Pools are process-local because
+    peer managers must not reuse the same default shared-memory name.
     """
     return L1ManagerConfig(
         memory_config=L1MemoryManagerConfig(
@@ -148,6 +149,7 @@ def make_l1_config(
             use_lazy=should_use_lazy_alloc() if use_lazy is None else use_lazy,
             init_size_in_bytes=min(size_in_bytes, 64 * 1024 * 1024),
             align_bytes=0x1000,
+            shm_name="",
         ),
         write_ttl_seconds=600,
         read_ttl_seconds=300,
