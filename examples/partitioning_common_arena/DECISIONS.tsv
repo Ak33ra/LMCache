@@ -1,0 +1,7 @@
+ts	phase	decision	why	evidence	result
+2026-11-03T20:46:00Z	design	Use existing native L1MemoryManager behind one operation owner	L1Manager owns allocation and uses TTL expiry for reclamation	lmcache/v1/distributed/l1_manager.py:220	selected bounded standalone prototype
+2026-11-03T20:46:00Z	probe	Cast native byte views to unsigned bytes	The native ctypes view exposes unsupported assignment format <B	lmcache/v1/memory_management.py:865	first probe allocated 4096 physical bytes for 37 logical bytes; write failed before cast
+2026-11-03T20:57:50Z	backing	Use one uniquely named POSIX SHM mapping	The ordinary torch fallback adds a page beyond its reported usable pool; SHM mapping size is inspectable	lmcache/v1/platform/torch_ops/mem_alloc.py:48	Exact mapping size and unlink passed in the runner
+2026-11-03T20:57:50Z	verification	Keep real byte and failure checks in the standalone experiment	Operation pins must survive paused copying and failed allocation without granting capacity	examples/partitioning_common_arena/test_arena.py	21 tests passed without allocator mocks
+2026-11-03T20:57:50Z	scope	Leave MP integration and peer transfer unimplemented	A local common-pool experiment cannot establish network visibility or transport completion	examples/partitioning_common_arena/DESIGN.md	Explicit limitation in manual guide and results
+2026-11-03T20:57:50Z	review	Self-review implementation and hand the isolated branch to the coordinator	Task instructions prohibit extra subagents; no independent reviewer result is claimed	e8e7464f	Local review and static checks passed
