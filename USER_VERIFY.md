@@ -73,6 +73,8 @@ seconds, and graceful shutdown allows 15 seconds before killing the child.
 
 ```bash
 timeout 120s python examples/multi_process/cpu_inline_roundtrip.py
+python -m pytest --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
+  tests/v1/multiprocess/test_cpu_inline_roundtrip.py
 ```
 
 Expected final output:
@@ -92,6 +94,12 @@ its source tensors. Both subsequent reads must still equal the originals,
 even after the client overwrites its first returned copies. A three-chunk
 prefix request returns the two stored chunks, and a non-forced clear must
 make the key miss.
+
+The cleanup regression test starts a real child and injects a client-factory
+failure while that child is alive. It requires the child to be reaped before
+the exception returns. Expected result is **one passed, zero skipped**.
+Server cleanup also encloses client shutdown, so an exception from closing
+the client cannot bypass child termination.
 
 `verify_inline_roundtrip(client)` can also be imported by a verification
 harness that owns an isolated server and connected request client. It assumes
