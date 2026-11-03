@@ -136,5 +136,10 @@ def test_concurrent_same_key_admission_keeps_resident() -> None:
     assert result[1] is first.memory_obj
     assert torch.all(result[1].get_tensor(0) == 3)
     assert manager.get_memory_usage()[0] == 4096
+    assert manager.unsafe_read([KEY])[KEY][1] is first.memory_obj
+    assert not manager.is_key_evictable(KEY)
     manager.finish_read([KEY], read_locks=2)
+    assert manager.is_key_evictable(KEY)
+    assert manager.delete([KEY])[KEY] == L1Error.SUCCESS
+    assert manager.get_memory_usage()[0] == 0
     manager.close()

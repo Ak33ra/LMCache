@@ -751,6 +751,7 @@ class L1Manager(L1ManagerInterface):
             entry = self._pop_staging(key, operation.tag)
             del self._write_operations[handle.operation_id]
             entry.write_operation = False
+            entry.write_lock.unlock()
             if handle in discard:
                 freed.append(entry.memory_obj)
                 results[handle] = (L1Error.SUCCESS, None)
