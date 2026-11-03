@@ -225,6 +225,14 @@ class L2AdapterInterface(ABC):
 
         Returns:
             L2TaskId: the task id of the submitted store task.
+
+        Note:
+            Submitted buffers remain owned by the caller until the corresponding
+            terminal completion is returned. A completion must mean all local
+            source-buffer access has ended, on both success and failure. This
+            does not establish remote transport or shared-segment quiescence.
+            A submission exception does not prove rejection before buffer access;
+            the Store controller conservatively retains those allocations.
         """
         pass
 
