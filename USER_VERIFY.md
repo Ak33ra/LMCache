@@ -329,3 +329,60 @@ in unchanged `docs/source` files. These include duplicate labels, short
 title underlines, and an invalid YAML code-block directive in
 `legacy/production/observability/chunk_statistics.rst:291`.
 The log is `/tmp/kvc-cpu-docs-build.log`. No shared environment was modified.
+
+## M3d. Typed-inline CPU serving allocation lifetimes
+
+Use the existing CPU native environment, with this checkout first on the import
+path. The tests use real CPU allocations and native TTL locks.
+
+```bash
+export CUDA_VISIBLE_DEVICES=''
+export LMCACHE_TRACK_USAGE=false
+export PYTHONPATH="$PWD"
+export NUMBA_CACHE_DIR=/tmp/kvc-serving-numba
+/scratch/akira/lmcache-dev/bin/python -m pytest --confcutdir=tests/v1 \
+  -o addopts='' -o log_cli=false -q \
+  tests/v1/multiprocess/test_inline_operation_lifetimes.py \
+  tests/v1/distributed/test_l1_write_operations.py
+/scratch/akira/lmcache-dev/bin/python examples/multi_process/cpu_inline_roundtrip.py
+```
+
+The barrier tests pause real `Tensor.copy_` and `Tensor.clone` accesses beyond
+one-second reservation TTLs. Forced clear, deletion, and another allocation must
+not recycle their source/destination slot. The eventual bytes must match and the
+operation counters must return to zero. Other cases cover exceptions, partial
+misses, overflow allocation failure cleanup, and zero-lock store publication.
+The overflow failure and listener tests use controlled failure/notification
+injection; they do not prove a native transport failure contract.
+
+The separate-process TCP smoke must report both PASS lines for exact typed
+inline bytes, independent copies, prefix hits, lock release, clear, and graceful
+shutdown. These checks do not validate SHM worker access, GPU/RDMA copies,
+Mooncake terminal failures, or physical segment removal. The owner contract is
+in [the transfer design](docs/design/v1/multiprocess/engine_driven_transfer_design.md#inline-cpu-allocation-lifetimes).
+
+Recorded on 2026-11-03 in the serving-lifetimes worktree. The focused command
+passed **12 tests, zero skipped**. The expanded inline, multi-L1, Store-source,
+and prefetch-destination selection passed **144 tests, two existing device
+skips** before the final two focused additions. Both smoke PASS lines were
+observed. Ruff, isort, and whitespace checks passed. Sphinx generated HTML but
+failed its warnings-as-errors gate with the same 26 existing source diagnostics
+seen in M3b; the log is `/tmp/kvc-serving-docs.log`.
+
+Portable trace replay also has a focused check using the existing dispatcher:
+
+```bash
+/scratch/akira/lmcache-dev/bin/python -m pytest --confcutdir=tests/v1 \
+  -o addopts='' -o log_cli=false -q \
+  tests/v1/distributed/test_multi_l1.py::test_inline_operations_replay_existing_call_schema
+```
+
+It checks all five legacy call names through argument serialization and replay
+against a fresh owner, with no leftover read locks or open replay contexts.
+This test uses the existing CPU allocation fixture and establishes replay
+compatibility, not native allocation lifetime evidence.
+
+The complete `test_multi_l1.py` file plus both focused lifetime files passed
+**37 tests, zero skipped** after trace compatibility was added. The separate
+process smoke also passed again. Logs are `/tmp/kvc-serving-trace.log` and
+`/tmp/kvc-serving-smoke-final.log`.

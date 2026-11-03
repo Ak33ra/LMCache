@@ -36,6 +36,8 @@ from lmcache.v1.distributed.internal_api import (
     L1ManagerInterface,
     L1MemoryDesc,
     L1OperationResult,
+    L1ReadOperation,
+    L1WriteOperation,
     L2AdapterListener,
 )
 from lmcache.v1.distributed.l1_manager import L1Manager
@@ -363,6 +365,189 @@ class StorageManager:
             )
 
         return result
+
+    @enable_tracing(
+        qualname="lmcache.v1.distributed.storage_manager.StorageManager.reserve_write"
+    )
+    def reserve_write_operations(
+        self, keys: list[ObjectKey], layout_desc: MemoryLayoutDesc
+    ) -> dict[ObjectKey, L1WriteOperation]:
+        """Reserve pinned destinations using the configured overflow order.
+
+        Args:
+            keys: Distinct object keys to store.
+            layout_desc: Layout of each destination.
+
+        Returns:
+            Allocation-bound handles for successful reservations. Only OOM
+            advances to another manager. Complete every returned handle after
+            buffer access ends using ``finish_write_operations``.
+
+        Raises:
+            ValueError: Keys repeat.
+            Exception: Allocation fails; earlier reservations are discarded.
+        """
+        if len(set(keys)) != len(keys):
+            raise ValueError("Repeated keys in write operation reservation")
+        operations: dict[ObjectKey, L1WriteOperation] = {}
+        pending = keys
+        completed = False
+        try:
+            for manager in self._write_managers:
+                if not pending:
+                    break
+                results = manager.reserve_write_operations(
+                    pending, [False] * len(pending), layout_desc, tag=_L1_WRITE_TAG
+                )
+                operations.update(
+                    (key, handle)
+                    for key, (_, handle) in results.items()
+                    if handle is not None
+                )
+                pending = [k for k in pending if results[k][0] == L1Error.OUT_OF_MEMORY]
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.SM_WRITE_RESERVED,
+                    metadata={
+                        "succeeded_keys": list(operations),
+                        "failed_keys": [k for k in keys if k not in operations],
+                    },
+                )
+            )
+            if pending:
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.L1_ALLOCATION_FAILED,
+                        metadata={"during": "l1_store", "keys": pending},
+                    )
+                )
+            completed = True
+            return operations
+        finally:
+            if not completed:
+                self.finish_write_operations(operations, written_keys=frozenset())
+
+    def finish_write_operations(
+        self,
+        operations: dict[ObjectKey, L1WriteOperation],
+        *,
+        written_keys: frozenset[ObjectKey],
+    ) -> None:
+        """Publish completed writes and discard exact unwritten allocations.
+
+        Args:
+            operations: Original handles returned by reserve_write_operations.
+            written_keys: Successfully copied keys; all others are discarded.
+
+        Raises:
+            ValueError: A key is outside the reservation or a handle is invalid.
+
+        Call only after synchronous copies or confirmed transfer completion.
+        No serving read locks are added by store admission.
+        """
+        if not written_keys.issubset(operations):
+            raise ValueError("Written keys are outside the reservation")
+        groups: dict[int, list[L1WriteOperation]] = defaultdict(list)
+        for handle in operations.values():
+            if handle.manager_id not in self._l1_managers_by_id:
+                raise ValueError("Write operation requires a registered owner")
+            groups[handle.manager_id].append(handle)
+        discarded = frozenset(
+            handle for key, handle in operations.items() if key not in written_keys
+        )
+        if is_tracing_enabled() and not self.is_multi_l1:
+            for group in (
+                [k for k in operations if k in written_keys],
+                [k for k in operations if k not in written_keys],
+            ):
+                if group:
+                    publish_call_event(
+                        "lmcache.v1.distributed.storage_manager.StorageManager.finish_write",
+                        {"keys": group},
+                    )
+        for owner, handles in groups.items():
+            self._l1_managers_by_id[owner].finish_write_operations(
+                handles, discard=discarded.intersection(handles), read_locks=0
+            )
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SM_WRITE_FINISHED,
+                metadata={
+                    "succeeded_keys": [k for k in operations if k in written_keys],
+                    "failed_keys": [k for k in operations if k not in written_keys],
+                },
+            )
+        )
+
+    @contextmanager
+    def read_prefetched_operations(
+        self,
+        keys: list[ObjectKey],
+        l1_owners: dict[ObjectKey, int] | None = None,
+    ) -> Iterator[list[MemoryObj] | None]:
+        """Pin prefetched allocations for synchronous buffer access.
+
+        Args:
+            keys: Keys from the caller's prefetch reservation, in payload order.
+            l1_owners: Exact owners returned by prefetch, required for multi-L1.
+
+        Yields:
+            All requested objects, or None when any allocation is unavailable.
+            Objects must not escape this context or back asynchronous copies.
+
+        Raises:
+            ValueError: An owner is missing or not registered.
+
+        Consumes one legacy prefetch read lock while each exact allocation is
+        pinned. Finally releases every acquired operation, even on partial
+        misses or caller exceptions. No session state or tombstones remain.
+        """
+        trace_context = (
+            "lmcache.v1.distributed.storage_manager."
+            "StorageManager.read_prefetched_results"
+        )
+        if is_tracing_enabled():
+            publish_call_event(trace_context + ".__enter__", {"keys": keys})
+        groups = self._read_groups(keys, l1_owners)
+        operations: dict[ObjectKey, L1ReadOperation] = {}
+        try:
+            for owner, group in groups.items():
+                manager = self._l1_managers_by_id[owner]
+                acquired = {
+                    key: handle
+                    for key, (_, handle) in manager.acquire_read_operations(
+                        group
+                    ).items()
+                    if handle is not None
+                }
+                operations.update(acquired)
+                manager.finish_read(list(acquired))
+            yield (
+                [operations[key].memory_obj for key in keys]
+                if len(operations) == len(set(keys))
+                else None
+            )
+        finally:
+            for owner in groups:
+                handles = [h for h in operations.values() if h.manager_id == owner]
+                self._l1_managers_by_id[owner].finish_read_operations(handles)
+            self._event_bus.publish(
+                Event(
+                    event_type=EventType.SM_READ_PREFETCHED_FINISHED,
+                    metadata={
+                        "succeeded_keys": list(operations),
+                        "failed_keys": [k for k in keys if k not in operations],
+                    },
+                )
+            )
+            if is_tracing_enabled():
+                publish_call_event(trace_context + ".__exit__", {"keys": keys})
+                if len(operations) == len(set(keys)):
+                    publish_call_event(
+                        "lmcache.v1.distributed.storage_manager."
+                        "StorageManager.finish_read_prefetched",
+                        {"keys": keys, "read_locks": 1},
+                    )
 
     def finish_write(
         self,

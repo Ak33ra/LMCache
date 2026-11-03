@@ -718,16 +718,18 @@ class L1Manager(L1ManagerInterface):
         Args:
             operations: Original active handles issued by this manager.
             discard: Subset to free without publishing, including failed loads.
-            read_locks: Serving TTL read locks taken atomically on admission.
+            read_locks: Nonnegative serving TTL locks taken on admission.
+                Zero publishes a normal store and notifies storage listeners.
 
         Returns:
-            SUCCESS and the resident read-locked object for admitted handles;
+            SUCCESS and the resident object for admitted handles;
             SUCCESS and None for discarded handles. An existing resident wins
-            same-key admission and receives the serving locks instead.
+            same-key admission and receives any requested serving locks instead.
 
         Raises:
             ValueError: A handle is stale, copied, foreign, repeated, or discard
-                is not a subset. Validation precedes every state change.
+                is not a subset, or read_locks is negative. Validation precedes
+                every state change.
 
         Cancellation and timeout alone are not completion. No tombstones remain
         after release. Serving TTL locks do not extend operation ownership.
@@ -740,7 +742,9 @@ class L1Manager(L1ManagerInterface):
             if tracked is None or tracked.handle is not handle:
                 raise ValueError("Write operation is not active on this manager")
             active.append(tracked)
-        total = validate_read_locks(read_locks)
+        if read_locks < 0:
+            raise ValueError("read_locks must be nonnegative")
+        total = validate_read_locks(read_locks) if read_locks else 0
         results: dict[L1WriteOperation, L1OperationResult] = {}
         freed: list[MemoryObj] = []
         admitted: list[ObjectKey] = []
@@ -762,8 +766,9 @@ class L1Manager(L1ManagerInterface):
             resident = self._objects.get(key)
             if resident is None:
                 self._objects[key] = entry
-                admitted.append(key)
-                metadata.append(self._object_meta(entry.memory_obj))
+                if total or not entry.is_temporary:
+                    admitted.append(key)
+                    metadata.append(self._object_meta(entry.memory_obj))
             else:
                 freed.append(entry.memory_obj)
                 entry = resident
@@ -773,14 +778,21 @@ class L1Manager(L1ManagerInterface):
             results[handle] = (L1Error.SUCCESS, entry.memory_obj)
         self._memory_manager.free(freed)
         self._report_staging_gone(gone)
-        if resident_keys:
+        if resident_keys and total:
             self._report_read_reserved(resident_keys)
         if admitted:
             for listener in self._registered_listeners:
-                listener.on_l1_keys_finish_write_and_reserve_read(admitted)
+                if total:
+                    listener.on_l1_keys_finish_write_and_reserve_read(admitted)
+                else:
+                    listener.on_l1_keys_write_finished(admitted)
             self._event_bus.publish(
                 Event(
-                    event_type=EventType.L1_WRITE_FINISHED_AND_READ_RESERVED,
+                    event_type=(
+                        EventType.L1_WRITE_FINISHED_AND_READ_RESERVED
+                        if total
+                        else EventType.L1_WRITE_FINISHED
+                    ),
                     metadata={
                         "l1_tag": self._config.tag,
                         "keys": admitted,

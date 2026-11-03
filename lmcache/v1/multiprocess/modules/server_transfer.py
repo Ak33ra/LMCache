@@ -12,7 +12,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheServerKey,
     PrepareRetrieveResponse,
@@ -234,14 +234,17 @@ class InlineTransferStrategy(TransferStrategy):
         instance_id: int,
         obj_keys: list[ObjectKey],
         chunks: list[torch.Tensor],
-        layout_desc: Any,
+        layout_desc: MemoryLayoutDesc,
     ) -> bool:
         """Reserve ``obj_keys``, copy the matching validated ``chunks`` in.
 
         Returns:
             ``True`` when every reserved object was written.
         """
-        reserved_dict = self._storage_manager.reserve_write(obj_keys, layout_desc)
+        operations = self._storage_manager.reserve_write_operations(
+            obj_keys, layout_desc
+        )
+        reserved_dict = {key: op.memory_obj for key, op in operations.items()}
         written_keys: list[ObjectKey] = []
         try:
             for idx, obj_key in enumerate(obj_keys):
@@ -281,26 +284,9 @@ class InlineTransferStrategy(TransferStrategy):
                 memory_obj.tensor.copy_(chunk_cpu)
                 written_keys.append(obj_key)
         finally:
-            # Complete by owner: with several L1 managers the reservations can
-            # live in different ones, and finish_write(keys) refuses that case.
-            if written_keys:
-                self._storage_manager.finish_write_by_owner(
-                    self._storage_manager.prepare_write_completion(
-                        {k: reserved_dict[k] for k in written_keys}
-                    )
-                )
-            # Release reservations that were never written so their write
-            # locks don't wedge later operations on the same keys, then drop
-            # the unwritten objects so they can never surface as cache hits.
-            written = set(written_keys)
-            leftover = [k for k in reserved_dict if k not in written]
-            if leftover:
-                self._storage_manager.finish_write_by_owner(
-                    self._storage_manager.prepare_write_completion(
-                        {k: reserved_dict[k] for k in leftover}
-                    )
-                )
-                self._storage_manager.delete_l1_keys(leftover)
+            self._storage_manager.finish_write_operations(
+                operations, written_keys=frozenset(written_keys)
+            )
 
         success = len(written_keys) == len(reserved_dict)
         if not success:
@@ -401,30 +387,19 @@ class InlineTransferStrategy(TransferStrategy):
 
         group_chunks: list[list[torch.Tensor]] = []
         for g_keys in group_keys:
-            prefetched_keys: list[ObjectKey] = []
-            try:
-                read_ctx = self._storage_manager.read_prefetched_results(
-                    g_keys, l1_owners=owners
-                )
-                with read_ctx as maybe_memory_objs:
-                    if not maybe_memory_objs or len(maybe_memory_objs) != len(g_keys):
+            with self._storage_manager.read_prefetched_operations(
+                g_keys, l1_owners=owners
+            ) as memory_objs:
+                if memory_objs is None:
+                    return PrepareRetrieveResponse(success=False, data=b"", context={})
+                chunks: list[torch.Tensor] = []
+                for memory_obj in memory_objs:
+                    if memory_obj.tensor is None:
                         return PrepareRetrieveResponse(
                             success=False, data=b"", context={}
                         )
-                    prefetched_keys = g_keys[: len(maybe_memory_objs)]
-                    chunks: list[torch.Tensor] = []
-                    for memory_obj in maybe_memory_objs:
-                        if memory_obj.tensor is None:
-                            return PrepareRetrieveResponse(
-                                success=False, data=b"", context={}
-                            )
-                        chunks.append(memory_obj.tensor.cpu().clone())
-                    group_chunks.append(chunks)
-            finally:
-                if prefetched_keys:
-                    self._storage_manager.finish_read_prefetched(
-                        prefetched_keys, l1_owners=owners
-                    )
+                    chunks.append(memory_obj.tensor.cpu().clone())
+                group_chunks.append(chunks)
 
         if multi_group:
             firsts = list(group_first_chunk) or [0] * len(group_keys)

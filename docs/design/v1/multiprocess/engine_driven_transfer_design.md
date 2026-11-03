@@ -323,3 +323,40 @@ the timing contract. Byte counts use SHM slot lengths or registered inline
 layouts, excluding serialization metadata. Each operation has a unique
 `transfer_key`, so simultaneous transfers from workers serving the same request
 cannot overwrite the throughput subscriber's timing state.
+
+### Inline CPU allocation lifetimes
+
+`InlineTransferStrategy.commit_store` reserves `L1WriteOperation` handles
+through `StorageManager.reserve_write_operations`. Each handle pins its exact
+unpublished allocation while `Tensor.copy_` runs. Completion publishes only
+successfully copied keys and discards the other exact allocations. Admission
+uses zero serving read locks and emits ordinary write-finished notifications,
+so StoreController still receives new inline writes. The write placement and
+OOM-only overflow order match legacy store reservations.
+
+`prepare_retrieve` uses `StorageManager.read_prefetched_operations`. It acquires
+exact `L1ReadOperation` handles from the owners recorded by prefetch before
+accessing tensors. It consumes the prefetch TTL locks while those handles pin
+the allocations. The context releases operations after synchronous CPU clones
+finish, including exceptions and partial misses. Serialization reads the clones,
+so the encoded response no longer depends on the L1 allocations.
+
+TTL expiry, forced clear, session cancellation, and an attempted future cancel
+cannot reclaim buffers during these operations. They may prevent a request from
+completing, but reclamation still waits for the synchronous buffer access to end.
+Handles live only in the active call, bounded by its reserved objects, with no
+per-session tombstone registry. Allocation failures on later overflow managers
+unwind earlier reservations. Multi-L1 reads use the captured owner map.
+
+This guarantee covers typed-inline CPU copies, including inline payloads sent
+to the SHM strategy's fallback. SHM slot access, CUDA/GPU copies, RDMA, and
+legacy LMCache-driven transfer still require their own completion evidence.
+The helper context must not expose buffers to asynchronous work or let objects
+escape its lifetime. A timeout or cancellation notification is not completion.
+
+`tests/v1/multiprocess/test_inline_operation_lifetimes.py` delays actual native
+CPU copies beyond their one-second TTL, attempts forced clear and reuse, checks
+the original bytes, and confirms reclamation after completion. It also covers
+copy exceptions, partial misses, normal store notifications, and cleanup after
+an injected overflow allocation failure. The separate-process check is
+`examples/multi_process/cpu_inline_roundtrip.py`.

@@ -18,6 +18,7 @@ import torch
 from lmcache import torch_dev, torch_device_type
 from lmcache.utils import EngineType
 from lmcache.v1.distributed.api import MemoryLayoutDesc
+from lmcache.v1.distributed.internal_api import L1WriteOperation
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.custom_types import (
     PrepareRetrieveResponse,
@@ -1890,13 +1891,15 @@ def test_server_store_and_retrieve_cpu_chunks(
     target_tensor = torch.zeros(2, 2, 8, 16)
     mock_memory_obj = MagicMock()
     mock_memory_obj.tensor = target_tensor
-    mock_storage.reserve_write.return_value = {"obj": mock_memory_obj}
+    mock_storage.reserve_write_operations.return_value = {
+        "obj": L1WriteOperation(0, 0, mock_memory_obj)
+    }
 
     @contextmanager
     def _read_prefetched_results(_keys: Any, l1_owners: Any = None) -> Any:
         yield [mock_memory_obj]
 
-    mock_storage.read_prefetched_results.side_effect = _read_prefetched_results
+    mock_storage.read_prefetched_operations.side_effect = _read_prefetched_results
     mock_session = MagicMock()
     mock_session.get_hashes.return_value = [b"h"]
     module, _, _, _ = server_module_factory(
@@ -1944,6 +1947,10 @@ def test_server_publishes_transfer_events(
     keys = ["obj0", "obj1"]
     storage = MagicMock()
     storage.reserve_write.return_value = dict(zip(keys, objects, strict=True))
+    storage.reserve_write_operations.return_value = {
+        key: L1WriteOperation(0, i, obj)
+        for i, (key, obj) in enumerate(zip(keys, objects, strict=True))
+    }
     storage.unsafe_read.return_value = (keys, objects)
 
     @contextmanager
@@ -1952,7 +1959,7 @@ def test_server_publishes_transfer_events(
     ) -> Iterator[list[MagicMock]]:
         yield objects
 
-    storage.read_prefetched_results.side_effect = read_prefetched
+    storage.read_prefetched_operations.side_effect = read_prefetched
     module, _, _, ctx = server_module_factory(
         storage_manager_config=_make_storage_manager_config(
             shm_name="events" if use_shm else "", pool_size=8192
@@ -2072,8 +2079,11 @@ def test_transfer_observations_expire_independently_of_worker_reaping(
             patch.object(ctx.event_bus, "publish", side_effect=events.append)
         )
         storage.reserve_write.return_value = {"obj": memory_obj}
+        storage.reserve_write_operations.return_value = {
+            "obj": L1WriteOperation(0, 0, memory_obj)
+        }
         storage.unsafe_read.return_value = (["obj"], [memory_obj])
-        storage.read_prefetched_results.side_effect = read_prefetched
+        storage.read_prefetched_operations.side_effect = read_prefetched
         clock.monotonic.return_value = 1000.0
         module.register_kv_cache_engine_driven_context(_default_register_payload())
         management = ManagementModule(
@@ -2150,7 +2160,7 @@ def test_server_pairs_interleaved_worker_transfers(
 ) -> None:
     """Workers sharing a request retain distinct transfer keys through commit."""
     storage = MagicMock()
-    storage.reserve_write.return_value = {}
+    storage.reserve_write_operations.return_value = {}
     module, _, _, ctx = server_module_factory(
         storage_manager_config=_make_storage_manager_config(),
         mock_storage=storage,
@@ -2194,7 +2204,7 @@ def test_server_commit_store_rejects_untyped_payload_before_storage_access(
     with pytest.raises(msgspec.DecodeError):
         module.commit_store(_default_key(), 2, b"not-a-typed-tensor-envelope")
 
-    mock_storage.reserve_write.assert_not_called()
+    mock_storage.reserve_write_operations.assert_not_called()
 
 
 def test_server_shm_commit_store_allows_noop_when_all_keys_exist(

@@ -368,7 +368,7 @@ class L1ManagerInterface(Protocol):
         discard: frozenset[L1WriteOperation] = frozenset(),
         read_locks: int = 1,
     ) -> dict[L1WriteOperation, L1OperationResult]:
-        """Complete exact destinations, discarding failures or admitting reads."""
+        """Complete destinations; zero read_locks publishes an ordinary store."""
         ...
 
     def reserve_write(
