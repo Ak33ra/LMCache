@@ -46,7 +46,7 @@ except ImportError:
     # Skip the tests if the L1MemoryManager cannot be imported
     pytest.skip("L1MemoryManager could not be imported", allow_module_level=True)
 
-if not torch_dev.is_available():
+if torch_device_type != "cpu" and not torch_dev.is_available():
     pytest.skip(
         f"Requires available {torch_device_type} runtime",
         allow_module_level=True,
