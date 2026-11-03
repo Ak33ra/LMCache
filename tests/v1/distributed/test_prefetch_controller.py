@@ -21,7 +21,7 @@ import pytest
 import torch
 
 # First Party
-from lmcache import torch_dev, torch_device_type
+from lmcache import lmcache_native, torch_dev, torch_device_type
 from lmcache.v1.distributed.api import (
     FULL_ATTENTION_WINDOW_CHUNKS,
     FetchingPolicy,
@@ -65,6 +65,9 @@ from lmcache.v1.distributed.storage_controllers.utils import (
 )
 from lmcache.v1.memory_management import MemoryObjMetadata, TensorMemoryObj
 from tests.v1.distributed.utils import should_use_lazy_alloc
+
+if not getattr(lmcache_native, "__file__", None):
+    pytest.skip("Requires compiled lmcache_native extension", allow_module_level=True)
 
 if torch_device_type != "cpu" and not torch_dev.is_available():
     pytest.skip(
