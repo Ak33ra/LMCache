@@ -32,6 +32,7 @@ from lmcache.v1.multiprocess.futures import (
 from lmcache.v1.multiprocess.request_handler import HandlerType
 from lmcache.v1.multiprocess.rpc import RpcOperation, RpcSpec, get_rpc_spec
 from lmcache.v1.multiprocess.transport.base import RequestServer
+from lmcache.v1.multiprocess.transport.request_limits import RequestLimits
 from lmcache.v1.multiprocess.transport.zmq_impl.wire import (
     decode_operation,
     encode_operation,
@@ -608,20 +609,50 @@ class NonBlockingRequestHandler(Generic[ResponseType, StateType]):
 
 
 class MessageQueueServer(RequestServer):
+    """Serve RPCs, optionally bounding accepted CPU request work.
+
+    With limits, overload and handler failures receive a refusal operation.
+    Unavailable peers cause nonblocking response drops. Streaming is refused.
+    Call close from one owner; bounded close waits for running handlers.
+    """
+
     MAX_REQUESTS_PER_POLL = 64
 
-    def __init__(self, bind_url: str, context: zmq.Context) -> None:
+    def __init__(
+        self,
+        bind_url: str,
+        context: zmq.Context,
+        limits: RequestLimits | None = None,
+    ) -> None:
+        """Bind a server with optional accepted-work and wire-byte limits.
+
+        Args:
+            bind_url: ZMQ endpoint to bind.
+            context: ZMQ context owned by the caller.
+            limits: Opt-in bounds, or None to preserve legacy behavior.
+        """
+        self._limits = limits
+        self._credits = threading.BoundedSemaphore(
+            limits.max_inflight_requests if limits else 1
+        )
+        self._closed = False
         # Socket
         self.ctx = context
         self.socket = self.ctx.socket(zmq.ROUTER)
         self.socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
+        if limits is not None:
+            self.socket.setsockopt(zmq.SNDHWM, limits.max_inflight_requests)
+            self.socket.setsockopt(zmq.RCVHWM, limits.max_inflight_requests)
+            self.socket.setsockopt(zmq.MAXMSGSIZE, limits.max_payload_bytes)
         self.socket.bind(bind_url)
         # Use a cross-platform Notifier instead of zmq PUSH/PULL sockets
         # because blocking handler callbacks run on ThreadPoolExecutor
         # threads, and zmq sockets are not thread-safe. Notifier.notify()
         # is atomic (eventfd on Linux, self-pipe elsewhere).
         self._output_efd = create_event_notifier()
-        self.output_queue: queue.Queue = queue.Queue()
+        self.output_queue: queue.Queue = queue.Queue(
+            maxsize=limits.max_inflight_requests if limits else 0
+        )
 
         # Poller
         self.poller = zmq.Poller()
@@ -760,6 +791,9 @@ class MessageQueueServer(RequestServer):
                 raise ValueError("Unknown handler type")
 
     def _handle_request(self, msg: list[bytes]) -> None:
+        if self._limits is not None:
+            self._handle_bounded_request(msg)
+            return
         assert len(msg) >= 3, (
             "Expected at least 3 message parts "
             "[identity, request_uid, operation, *payloads]"
@@ -793,17 +827,86 @@ class MessageQueueServer(RequestServer):
             logger.error("No handler registered for operation %s", operation)
             logger.error("Available handlers: %s", list(self.handlers.keys()))
 
+    def _refuse_request(self, prefix: list[bytes]) -> None:
+        try:
+            self.socket.send_multipart(
+                prefix[:2] + [encode_operation("__request_refused__")],
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.ZMQError:
+            logger.debug("Refused request destination unavailable")
+
+    def _handle_bounded_request(self, msg: list[bytes]) -> None:
+        """Keep one credit through handler completion and response disposal."""
+        limits = self._limits
+        assert limits is not None
+        if len(msg) < 3:
+            return
+        prefix = msg[:3]
+        if len(prefix[1]) > 64 or len(prefix[2]) > 128:
+            return
+        if sum(map(len, msg)) > limits.max_payload_bytes:
+            self._refuse_request(prefix)
+            return
+        try:
+            operation = decode_operation(prefix[2])
+            spec = get_rpc_spec(operation)
+        except (TypeError, ValueError, KeyError, msgspec.DecodeError):
+            self._refuse_request(prefix)
+            return
+        handler = self.handlers.get(operation)
+        if spec.streaming or handler is None:
+            self._refuse_request(prefix)
+            return
+        if not self._credits.acquire(blocking=False):
+            self._refuse_request(prefix)
+            return
+
+        def complete(future: Future) -> None:
+            try:
+                response = future.result()
+                encoded = msgspec_encode(response, handler.get_response_class())
+                frames = prefix + ([encoded] if response is not None else [])
+                if sum(map(len, frames)) > limits.max_payload_bytes:
+                    frames = prefix[:2] + [encode_operation("__request_refused__")]
+            except Exception:
+                logger.exception("Bounded request handler failed")
+                frames = prefix[:2] + [encode_operation("__request_refused__")]
+            if self.is_finished.is_set():
+                self._credits.release()
+                return
+            self.output_queue.put_nowait(frames)
+            self._output_efd.notify()
+
+        try:
+            if isinstance(handler, BlockingRequestHandler):
+                future = handler(msg[3:], affinity_key=hash(prefix[0]))
+            else:
+                future = Future()
+                future.set_result(handler(msg[3:]))
+        except Exception:
+            logger.exception("Bounded request dispatch failed")
+            self._credits.release()
+            self._refuse_request(prefix)
+            return
+        future.add_done_callback(complete)
+
     def _send_responses(self) -> None:
         try:
             while frames_to_send := self.output_queue.get_nowait():
                 key = (frames_to_send[0], frames_to_send[1])
                 try:
-                    self.socket.send_multipart(frames_to_send)
+                    self.socket.send_multipart(
+                        frames_to_send, flags=zmq.NOBLOCK if self._limits else 0
+                    )
                 except zmq.ZMQError:
                     if key in self.streams:
                         self.streams[key][0].close()
                     else:
                         logger.warning("Response destination disconnected")
+                finally:
+                    if self._limits is not None:
+                        self._credits.release()
                 if len(frames_to_send) == 3:
                     self.streams.pop(key, None)
         except queue.Empty:
@@ -1060,6 +1163,14 @@ class MessageQueueServer(RequestServer):
         self.worker_thread.start()
 
     def close(self) -> None:
+        """Stop serving and release resources; bounded mode drains handlers.
+
+        Sequential repeated calls are harmless. Call from the server owner,
+        never from a handler. A blocked handler keeps bounded close pending.
+        """
+        if self._closed:
+            return
+        self._closed = True
         self.is_finished.set()
         if self.worker_thread.is_alive():
             self.worker_thread.join()
@@ -1068,7 +1179,14 @@ class MessageQueueServer(RequestServer):
         for _, _, thread in list(self.streams.values()):
             thread.join()
         self.streams.clear()
-        self.socket.close()
+        self.socket.close(linger=0 if self._limits else None)
         for pool in self.extra_pools:
-            pool.shutdown(wait=False)
+            pool.shutdown(wait=self._limits is not None)
+        if self._limits is not None:
+            while True:
+                try:
+                    self.output_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._credits.release()
         self._output_efd.close()
