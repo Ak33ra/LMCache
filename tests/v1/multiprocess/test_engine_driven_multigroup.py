@@ -4,6 +4,7 @@ Tests for engine-driven multi-group (uniform coverage) transfers.
 """
 
 # Standard
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock
@@ -17,6 +18,7 @@ import torch
 # First Party
 from lmcache import torch_dev, torch_device_type
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.internal_api import L1WriteOperation
 from lmcache.v1.multiprocess.custom_types import (
     GroupLayout,
     IPCCacheServerKey,
@@ -498,6 +500,43 @@ class _FakeStorageManager:
             reserved[obj_key] = obj
         return reserved
 
+    def reserve_write_operations(
+        self, obj_keys: list[ObjectKey], layout: MemoryLayoutDesc
+    ) -> dict[ObjectKey, L1WriteOperation]:
+        """Return owner-tagged capabilities for the inline strategy double."""
+        return {
+            key: L1WriteOperation(obj.get_l1_manager(), index, obj)
+            for index, (key, obj) in enumerate(
+                self.reserve_write(obj_keys, layout).items()
+            )
+        }
+
+    def finish_write_operations(
+        self,
+        operations: dict[ObjectKey, L1WriteOperation],
+        *,
+        written_keys: frozenset[ObjectKey],
+    ) -> None:
+        """Record admitted writes and discard unwritten staging objects."""
+        self.finished_writes.extend(written_keys)
+        self.finished_owners.update(
+            handle.manager_id
+            for key, handle in operations.items()
+            if key in written_keys
+        )
+        self.delete_l1_keys([key for key in operations if key not in written_keys])
+
+    @contextmanager
+    def read_prefetched_operations(
+        self, obj_keys: list[ObjectKey], l1_owners: dict[ObjectKey, int] | None = None
+    ) -> Iterator[list[_FakeMemoryObj] | None]:
+        """Model context-scoped prefetch consumption for strategy tests."""
+        with self.read_prefetched_results(obj_keys, l1_owners) as objects:
+            try:
+                yield objects if len(objects) == len(obj_keys) else None
+            finally:
+                self.finish_read_prefetched([k for k in obj_keys if k in self.objs])
+
     def finish_write(self, keys):
         raise ValueError("multiple L1 managers: complete writes by owner")
 
@@ -632,9 +671,8 @@ def test_inline_strategy_store_shape_mismatch_releases_reservations() -> None:
         )
         is False
     )
-    # Every reservation was finished (written or released) and the two
-    # mismatched group-1 objects were deleted rather than left as garbage.
-    assert set(sm.finished_writes) == set(group_keys[0]) | set(group_keys[1])
+    # Mismatched group-1 staging allocations are discarded without admission.
+    assert set(sm.finished_writes) == set(group_keys[0])
     assert set(sm.deleted) == set(group_keys[1])
     assert _obj_key(1, 1) not in sm.objs
     assert _obj_key(2, 1) not in sm.objs

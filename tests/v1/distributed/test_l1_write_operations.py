@@ -143,3 +143,15 @@ def test_concurrent_same_key_admission_keeps_resident() -> None:
     assert manager.delete([KEY])[KEY] == L1Error.SUCCESS
     assert manager.get_memory_usage()[0] == 0
     manager.close()
+
+
+def test_zero_read_lock_admission_and_negative_rejection(manager: L1Manager) -> None:
+    """Normal stores publish without a TTL reader; invalid counts retain ownership."""
+    handle = reserve(manager)
+    with pytest.raises(ValueError, match="nonnegative"):
+        manager.finish_write_operations([handle], read_locks=-1)
+    assert manager.get_staging_memory_usage() == 4096
+    result = manager.finish_write_operations([handle], read_locks=0)
+    assert result[handle][0] == L1Error.SUCCESS
+    assert manager.is_key_evictable(KEY)
+    assert manager.delete([KEY])[KEY] == L1Error.SUCCESS

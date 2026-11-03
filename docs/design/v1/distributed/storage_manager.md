@@ -192,3 +192,32 @@ tracks `(tag, key)` so one copy's eviction cannot end another copy's lifetime.
 Single-L1 status aliases and key-only completion remain
 compatible. Single-region descriptors, P2P, shared-memory transfer, and legacy
 Device-DAX hotplug remain guarded for multi-L1 configurations.
+
+## Synchronous serving operations
+
+Typed-inline CPU transfer uses operation-bound helpers instead of TTL-only
+reservations. `reserve_write_operations` follows the same OOM-only overflow
+order and returns a key-to-`L1WriteOperation` mapping. A later manager's allocation
+exception discards earlier handles. `finish_write_operations` admits the
+`written_keys` subset without read locks and discards every other exact staging
+allocation. Ordinary write-finished notifications continue to drive L2 stores.
+
+`read_prefetched_operations` resolves the captured owner map, acquires exact
+source handles, consumes one prefetch TTL lock per acquired object while it is
+pinned, and yields all objects or `None` for a partial miss. Context exit releases
+all acquired operations, including exceptions. Its objects must stay inside the
+context and must not back asynchronous work. No session-wide operation registry
+is added. Multi-manager acquisition errors unwind earlier source handles.
+
+These helpers preserve allocation ownership during synchronous CPU access.
+They do not replace legacy GPU stream callbacks or SHM worker completion.
+See the [inline transfer contract](../multiprocess/engine_driven_transfer_design.md#inline-cpu-allocation-lifetimes)
+for the converted call sites and real-buffer verification.
+
+Single-L1 trace replay retains the existing call names and key/layout payloads.
+Operation-backed writes record `reserve_write` and `finish_write`; reads record
+`read_prefetched_results.__enter__`, `.__exit__`, and `finish_read_prefetched`.
+The release record follows the copy, preserving the replayed access interval.
+No operation capability or process-local manager ID is serialized. The existing
+multi-L1 replay limitation remains. `test_multi_l1.py` serializes these records
+and dispatches them against a fresh manager through the unchanged dispatcher.

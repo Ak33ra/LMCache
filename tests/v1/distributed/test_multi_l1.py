@@ -527,3 +527,48 @@ def test_delete_reports_a_key_as_skipped_while_any_copy_is_locked(
     assert store.delete_l1_keys(keys) == (0, 1)
     managers[locked_index].finish_read(keys)
     assert store.delete_l1_keys(keys) == (1, 0)
+
+
+def test_inline_operations_replay_existing_call_schema(
+    storage_factory: StorageFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operation capabilities never enter the legacy portable replay stream."""
+    source, (source_l1,), _ = storage_factory((4096,))
+    events: list[Event] = []
+    bus = Mock()
+    bus.publish.side_effect = events.append
+    monkeypatch.setattr(trace_decorator, "get_event_bus", lambda: bus)
+    trace_decorator.set_tracing_enabled(True)
+    try:
+        operations = source.reserve_write_operations([key(1)], LAYOUT)
+        source.finish_write_operations(operations, written_keys=frozenset([key(1)]))
+        source_l1.reserve_read([key(1)])
+        with source.read_prefetched_operations([key(1)]) as objects:
+            assert objects is not None
+    finally:
+        trace_decorator.set_tracing_enabled(False)
+
+    prefix = "lmcache.v1.distributed.storage_manager.StorageManager."
+    assert [event.metadata["qualname"] for event in events] == [
+        prefix + "reserve_write",
+        prefix + "finish_write",
+        prefix + "read_prefetched_results.__enter__",
+        prefix + "read_prefetched_results.__exit__",
+        prefix + "finish_read_prefetched",
+    ]
+    target, (target_l1,), _ = storage_factory((4096,))
+    context = ReplayContext(target)
+    dispatcher = build_default_dispatcher()
+    for index, event in enumerate(events):
+        if index == 2:
+            target_l1.reserve_read([key(1)])
+        payload = msgspec.msgpack.encode(codecs.encode_args(event.metadata["args"]))
+        dispatcher.dispatch(
+            event.metadata["qualname"],
+            context,
+            codecs.decode_args(msgspec.msgpack.decode(payload)),
+        )
+    assert not context.open_read_contexts
+    assert target_l1.report_status()["read_locked_count"] == 0
+    assert target_l1.get_object_state(key(1)) is not None

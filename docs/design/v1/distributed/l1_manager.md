@@ -153,3 +153,9 @@ Completed handles leave no registry tombstones. The real-buffer regression in
 `tests/v1/distributed/test_l1_write_operations.py` pauses a writer past native
 TTL expiry, attempts every reclaim path, then verifies its late bytes and
 same-key replacement protection. It does not claim native Store drain evidence.
+
+Write operation completion accepts `read_locks=0` for ordinary store admission.
+It adds no TTL reader and emits the normal write-finished event and listener
+callback for non-temporary newly admitted objects. Positive counts retain the
+prefetch completion behavior; negative counts fail before changing ownership.
+Temporary zero-lock admissions remain excluded from Store notifications.
