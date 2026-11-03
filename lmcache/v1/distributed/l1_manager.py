@@ -28,6 +28,8 @@ from lmcache.v1.distributed.internal_api import (
     L1ManagerListener,
     L1ObjectMeta,
     L1OperationResult,
+    L1ReadOperation,
+    L1ReadOperationResult,
 )
 from lmcache.v1.distributed.memory_manager import (
     GDSL1MemoryManager,
@@ -111,6 +113,18 @@ class L1ObjectState:
 
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
+
+    read_operations: int = 0
+    """Explicit readers whose lifetime does not expire with a reservation TTL."""
+
+
+@dataclass
+class ActiveReadOperation:
+    """Manager-owned binding between a capability and its exact allocation."""
+
+    key: ObjectKey
+    state: L1ObjectState
+    handle: L1ReadOperation
 
 
 def l1_mgr_synchronized(func):
@@ -210,6 +224,9 @@ class L1Manager(L1ManagerInterface):
 
         # Resident objects: readable, never write-locked.
         self._objects: dict[ObjectKey, L1ObjectState] = {}
+        self._read_operation_ids = count()
+        self._read_operations: dict[int, ActiveReadOperation] = {}
+        self._discarded_reads: dict[ObjectKey, L1ObjectState] = {}
         # Staging objects: key -> writer tag -> write-locked object that is
         # invisible to readers until it is admitted by finish_write.
         self._staging: dict[ObjectKey, dict[str, L1ObjectState]] = {}
@@ -342,6 +359,100 @@ class L1Manager(L1ManagerInterface):
         return ret
 
     @l1_mgr_synchronized
+    def acquire_read_operations(
+        self, keys: list[ObjectKey]
+    ) -> dict[ObjectKey, L1ReadOperationResult]:
+        """Pin resident allocations without a TTL until explicit completion.
+
+        Args:
+            keys: Resident keys to read; duplicate keys acquire one handle.
+
+        Returns:
+            Per-key SUCCESS and a handle, KEY_NOT_EXIST for a missing key, or
+            KEY_IS_LOCKED at the per-allocation limit of 128 active operations.
+            The caller must release each handle after all buffer access ends.
+        """
+        results: dict[ObjectKey, L1ReadOperationResult] = {}
+        acquired: list[ObjectKey] = []
+        for key in dict.fromkeys(keys):
+            entry = self._objects.get(key)
+            if entry is None:
+                results[key] = (L1Error.KEY_NOT_EXIST, None)
+            elif entry.read_operations >= MAX_READ_LOCK_COUNT:
+                results[key] = (L1Error.KEY_IS_LOCKED, None)
+            else:
+                operation_id = next(self._read_operation_ids)
+                handle = L1ReadOperation(
+                    self._l1_manager_id, operation_id, entry.memory_obj
+                )
+                self._read_operations[operation_id] = ActiveReadOperation(
+                    key, entry, handle
+                )
+                entry.read_operations += 1
+                results[key] = (L1Error.SUCCESS, handle)
+                acquired.append(key)
+        self._report_read_reserved(acquired)
+        return results
+
+    @l1_mgr_synchronized
+    def finish_read_operations(
+        self,
+        operations: list[L1ReadOperation],
+        *,
+        discard: frozenset[L1ReadOperation] = frozenset(),
+    ) -> None:
+        """Complete a validated batch, optionally discarding its exact allocations.
+
+        Args:
+            operations: Original handles issued by this manager, each once.
+            discard: Subset whose allocations should be discarded after every
+                operation and legacy TTL reader releases them.
+
+        Raises:
+            ValueError: A handle is foreign, copied, already completed, repeated,
+                or discard is not a subset. The entire batch remains unchanged.
+
+        Note:
+            Call only after buffer access has ended. Cancellation and timeout
+            alone do not establish that condition. No completion tombstones are
+            kept; live handle identity binds release to its original allocation.
+        """
+        if len(set(operations)) != len(operations) or not discard.issubset(operations):
+            raise ValueError("Repeated operation or discard outside completion batch")
+        active: list[ActiveReadOperation] = []
+        for handle in operations:
+            tracked = self._read_operations.get(handle.operation_id)
+            if tracked is None or tracked.handle is not handle:
+                raise ValueError("Read operation is not active on this manager")
+            active.append(tracked)
+        completed: list[ObjectKey] = []
+        for operation in active:
+            del self._read_operations[operation.handle.operation_id]
+            operation.state.read_operations -= 1
+            if operation.handle in discard or operation.state.is_temporary:
+                self._discarded_reads[operation.key] = operation.state
+            completed.append(operation.key)
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_read_finished(completed)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_READ_FINISHED,
+                metadata={"l1_tag": self._config.tag, "keys": completed},
+            )
+        )
+        self._reclaim_discarded_reads()
+
+    @l1_mgr_synchronized
+    def reclaim_discarded_read_operations(self) -> int:
+        """Reclaim exact discarded allocations after their legacy readers expire.
+
+        Returns:
+            The number of discarded allocations still held by readers.
+        """
+        self._reclaim_discarded_reads()
+        return len(self._discarded_reads)
+
+    @l1_mgr_synchronized
     def unsafe_read(
         self,
         keys: list[ObjectKey],
@@ -439,10 +550,15 @@ class L1Manager(L1ManagerInterface):
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
-            if entry.is_temporary and not entry.read_lock.is_locked():
+            if (
+                (entry.is_temporary or key in self._discarded_reads)
+                and not entry.read_lock.is_locked()
+                and not entry.read_operations
+            ):
                 need_to_free.append(entry.memory_obj)
                 need_to_free_keys.append(key)
                 del self._objects[key]
+                self._discarded_reads.pop(key, None)
 
             ret[key] = L1Error.SUCCESS
             successful_keys.append(key)
@@ -762,8 +878,8 @@ class L1Manager(L1ManagerInterface):
             keys: The list of object keys to delete.
             force: When True, delete even a read-locked key and discard its
                 live staging objects. This may free memory a concurrent
-                store/read still uses (same hazard as :meth:`clear` with
-                ``force=True``); use with care.
+                legacy reader still uses; explicit operation handles always
+                prevent deletion, including when force is True.
 
         Returns:
             A dictionary mapping each object key to an L1Error.
@@ -771,8 +887,8 @@ class L1Manager(L1ManagerInterface):
         Errors:
             KEY_NOT_EXIST: The key does not exist.
             KEY_IS_LOCKED: The key is read-locked, or a live staging object
-                exists for it, so it cannot be deleted. Never returned when
-                ``force`` is True.
+                exists for it, or an explicit read operation owns its allocation.
+                Explicit operations also return this error when force is True.
         """
         need_to_free: list[MemoryObj] = []
         ret: dict[ObjectKey, L1Error] = {}
@@ -796,6 +912,9 @@ class L1Manager(L1ManagerInterface):
                 gone_keys.append(key)
                 continue
 
+            if entry.read_operations:
+                ret[key] = L1Error.KEY_IS_LOCKED
+                continue
             locked = entry.read_lock.is_locked()
             if locked and not force:
                 ret[key] = L1Error.KEY_IS_LOCKED
@@ -880,57 +999,20 @@ class L1Manager(L1ManagerInterface):
         """Clear objects from L1 cache.
 
         Args:
-            force: If True, clear ALL objects including read-locked ones and
-                every staging object. This may corrupt in-flight
-                store/prefetch operations. If False (default), only clear
+            force: If True, clear objects with legacy TTL read locks and
+                every staging object. This may corrupt legacy serving reads or
+                prefetch writes. Explicit read operations always prevent freeing
+                their allocations. If False (default), only clear
                 unlocked resident objects and staging objects whose write
                 lock expired, keeping read-locked objects and live staging
                 objects intact.
         """
-        if force:
-            staging_count = sum(len(per_tag) for per_tag in self._staging.values())
-            logger.warning(
-                "L1Manager: force-clearing all %d objects and %d staging objects "
-                "(including locked ones). This may corrupt in-flight "
-                "store/prefetch operations — use with caution.",
-                len(self._objects),
-                staging_count,
-            )
-            all_keys = list(self._objects.keys())
-            all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
-            all_meta = [self._object_meta(obj) for obj in all_memory_objs]
-            self._memory_manager.free(all_memory_objs)
-            self._objects.clear()
-            for listener in self._registered_listeners:
-                listener.on_l1_keys_deleted_by_manager(all_keys)
-            self._event_bus.publish(
-                Event(
-                    event_type=EventType.L1_KEYS_EVICTED,
-                    metadata={
-                        "l1_tag": self._config.tag,
-                        "keys": all_keys,
-                        "meta": all_meta,
-                    },
-                )
-            )
-            cleared = set(all_keys)
-            staging_keys = [k for k in self._staging if k not in cleared]
-            for key in list(self._staging.keys()):
-                self._reclaim_staging(key, force=True)
-            self._report_staging_gone(staging_keys)
-            logger.info(
-                "L1Manager: cleared %d objects and %d staging objects, 0 remaining.",
-                len(all_keys),
-                staging_count,
-            )
-            return
-
         keys_to_clear: list[ObjectKey] = []
         objs_to_free: list[MemoryObj] = []
         locked_count = 0
 
         for key, entry in list(self._objects.items()):
-            if entry.read_lock.is_locked():
+            if entry.read_operations or (entry.read_lock.is_locked() and not force):
                 locked_count += 1
                 continue
             keys_to_clear.append(key)
@@ -945,7 +1027,7 @@ class L1Manager(L1ManagerInterface):
         reclaimed_count = 0
         gone_keys: list[ObjectKey] = []
         for key in list(self._staging.keys()):
-            reclaimed = self._reclaim_staging(key, force=False)
+            reclaimed = self._reclaim_staging(key, force=force)
             reclaimed_count += reclaimed
             if reclaimed and key not in self._staging and key not in self._objects:
                 gone_keys.append(key)
@@ -976,6 +1058,8 @@ class L1Manager(L1ManagerInterface):
             or a staging object whose write lock expired; False otherwise.
         """
         entry = self._objects.get(key, None)
+        if entry is not None and entry.read_operations:
+            return False
         if entry is not None and not entry.read_lock.is_locked():
             return True
         per_tag = self._staging.get(key, None)
@@ -1182,14 +1266,22 @@ class L1Manager(L1ManagerInterface):
         return self._config
 
     def close(self) -> None:
-        """Close the L1Manager and free all resources."""
-        close_l1_gds_context(self._l1_manager_id)
+        """Free resources only when explicit operations have completed.
+
+        Raises:
+            RuntimeError: Read operations remain active. Allocations stay valid,
+                and callers may drain completions and retry closing.
+        """
         with self._lock:
+            if self._read_operations:
+                raise RuntimeError("Cannot close L1 with active read operations")
+            close_l1_gds_context(self._l1_manager_id)
             all_memory_objs = [entry.memory_obj for entry in self._objects.values()]
             for per_tag in self._staging.values():
                 all_memory_objs.extend(staged.memory_obj for staged in per_tag.values())
             self._memory_manager.free(all_memory_objs)
             self._objects.clear()
+            self._discarded_reads.clear()
             self._staging.clear()
             self._staging_bytes = 0
 
@@ -1232,6 +1324,8 @@ class L1Manager(L1ManagerInterface):
             "total_object_count": len(self._objects) + staging,
             "write_locked_count": write_locked,
             "read_locked_count": read_locked,
+            "active_read_operation_count": len(self._read_operations),
+            "pending_discard_count": len(self._discarded_reads),
             "temporary_count": temporary,
             "staging_object_count": staging,
             "staging_bytes": self._staging_bytes,
@@ -1407,6 +1501,8 @@ class L1Manager(L1ManagerInterface):
     ) -> None:
         """Free ``objs`` and report ``keys`` as deleted to listeners and
         the event bus."""
+        for key in keys:
+            self._discarded_reads.pop(key, None)
         freed_meta = [self._object_meta(obj) for obj in objs]
         self._memory_manager.free(objs)
 
@@ -1418,6 +1514,20 @@ class L1Manager(L1ManagerInterface):
                 metadata={"l1_tag": self._config.tag, "keys": keys, "meta": freed_meta},
             )
         )
+
+    def _reclaim_discarded_reads(self) -> None:
+        """Reclaim retired allocations, never resolving deletion through a new key."""
+        keys: list[ObjectKey] = []
+        objects: list[MemoryObj] = []
+        for key, entry in list(self._discarded_reads.items()):
+            if entry.read_operations or entry.read_lock.is_locked():
+                continue
+            assert self._objects.get(key) is entry
+            del self._objects[key]
+            keys.append(key)
+            objects.append(entry.memory_obj)
+        if keys:
+            self._free_and_report_deleted(keys, objects)
 
     def _object_meta(self, memory_obj: MemoryObj) -> L1ObjectMeta:
         """Build the listener-facing metadata for one resident object."""

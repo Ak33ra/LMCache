@@ -98,3 +98,32 @@ That window is the L2 lookup latency, not the L2 load time as before; see
 
 `tests/v1/distributed/test_l1_manager.py` (`TestStaging*` classes) and
 `tests/v1/distributed/test_prefetch_controller.py::TestConcurrentPrefetchSameKeys`.
+
+## Explicit allocation read operations
+
+TTL read reservations describe sessions. They do not prove that a buffer
+consumer has finished. `acquire_read_operations(keys)` returns one
+`L1ReadOperation` capability per resident key. A manager-owned table binds the
+exact handle identity to the original `L1ObjectState`; release never resolves
+the key to its current allocation. Up to 128 operations may own an allocation.
+Completing an operation removes its table entry without retaining tombstones.
+
+`finish_read_operations(handles, discard=...)` validates the whole batch
+before changing any ownership. Copied, foreign, duplicate, and completed
+handles raise `ValueError`. Selected discard handles mark their exact
+allocations for deletion after all explicit operations and legacy readers
+finish. `reclaim_discarded_read_operations()` also reclaims these allocations
+when abandoned legacy readers expire. Deleting an allocation removes its
+pending discard, so a replacement with the same key does not inherit it.
+
+Active operations prevent ordinary and forced deletion, clear, eviction,
+and temporary-object release. `close()` raises before releasing any resources
+when explicit operations remain. The caller may drain completions and retry.
+`reserve_read` and `finish_read` retain their legacy TTL semantics.
+
+This API is a buffer ownership primitive. Callers must hold handles until
+buffer access ends, including on cancellation and timeout. It does not itself
+prove native or transport quiescence, protect prefetch staging writes, or
+convert legacy serving reads. Unconverted paths remain subject to TTL expiry.
+`test_l1_read_operations.py` verifies real CPU bytes, expiry, force clear,
+failed close, handle admission, batch validation, and discard across key reuse.
