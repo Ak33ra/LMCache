@@ -109,3 +109,23 @@ etc.), see `Mooncake <https://github.com/kvcache-ai/Mooncake>`_ .
 - If Mooncake RDMA initialization fails at adapter creation time, verify that
   LMCache L1 memory is enabled and that the descriptor has a non-zero pointer
   and size.
+
+Experimental CPU partition controls
+-----------------------------------
+
+The native connector accepts ``partition_controls=True`` only with the fenced
+CPU TCP SDK fork. This mode requires zero setup shared capacity and dynamic
+local-buffer registration. It exposes explicit local registration, removable
+shared segment allocation/release, accounting snapshots, and retryable close.
+It does not enable partitioning in the MP server by itself.
+
+Control calls return typed results. ``BUSY`` retains all ownership for retry.
+Failed shared allocation can retain physical backing, reported separately from
+mounted shared segments. Private deregistration releases transport registration
+only; the caller still owns its backing. Keep private backing alive until
+explicit cleanup succeeds.
+
+The build and live-master verification commands are documented in
+``docs/design/v1/distributed/l2_adapters/mooncake_partition_controls.md``.
+The checked-in probe is
+``csrc/storage_backends/mooncake/verify_partition_controls.py``.

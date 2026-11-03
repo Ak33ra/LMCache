@@ -4,12 +4,15 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 // Third Party
 #include "config.h"
+#include "cachelib_memory_allocator/Slab.h"
 
 // Local
 #include "connector.h"
@@ -29,14 +32,28 @@ void ensure_batch_result_size(const std::vector<T>& results, size_t expected,
   }
 }
 
+template <typename Operation>
+int control_sdk_call(Operation&& operation) {
+  try {
+    return operation();
+  } catch (const std::exception& error) {
+    fprintf(stderr, "[LMCache Mooncake] partition SDK exception: %s\n",
+            error.what());
+    return -1;
+  }
+}
+
 }  // namespace
 
 MooncakeConnector::MooncakeConnector(ConfigDict config, int num_workers,
                                      L1RegistrationConfig l1_registration,
-                                     WorkerPoolConfig worker_pool_config)
+                                     WorkerPoolConfig worker_pool_config,
+                                     bool partition_controls)
     : ConnectorBase(num_workers, std::move(worker_pool_config)),
       config_(std::move(config)),
-      l1_registration_(l1_registration) {
+      l1_registration_(l1_registration),
+      partition_controls_(partition_controls) {
+  if (partition_controls_) validate_partition_config();
   // Create a RealClient via the static factory.
   client_ = mooncake::RealClient::create();
   if (!client_) {
@@ -54,15 +71,44 @@ MooncakeConnector::MooncakeConnector(ConfigDict config, int num_workers,
     preregister_l1_memory(l1_registration.base, l1_registration.size);
   }
 
+  if (partition_controls_) {
+    refresh_partition_status();
+    if (!partition_status().enabled) {
+      throw std::runtime_error(
+          "Mooncake strict CPU TCP ownership is unavailable");
+    }
+  }
   start_workers();  // IMPORTANT: call at END of ctor
 }
 
 MooncakeConnector::~MooncakeConnector() {
-  close();
-  if (client_) {
-    client_->tearDownAll();
-    client_.reset();
+  if (partition_controls_) {
+    const auto result = close_partition();
+    if (result.code != PartitionControlCode::SUCCESS) {
+      fprintf(
+          stderr,
+          "[LMCache Mooncake] unresolved partition ownership at destruction; "
+          "caller must retain private backing after close failure\n");
+      ConnectorBase<WorkerMooncakeConn>::close();
+    }
+  } else {
+    close();
+    if (client_) client_->tearDownAll();
   }
+}
+
+void MooncakeConnector::close() {
+  if (partition_controls_) {
+    const auto result = close_partition();
+    if (result.code != PartitionControlCode::SUCCESS) {
+      throw std::runtime_error(
+          "Mooncake partition close incomplete; retain backing and retry "
+          "close_partition()");
+    }
+    return;
+  }
+  std::lock_guard<std::mutex> guard(close_mutex_);
+  ConnectorBase<WorkerMooncakeConn>::close();
 }
 
 WorkerMooncakeConn MooncakeConnector::create_connection() {
@@ -74,6 +120,9 @@ WorkerMooncakeConn MooncakeConnector::create_connection() {
 void MooncakeConnector::do_single_get(WorkerMooncakeConn& conn,
                                       const std::string& key, void* buf,
                                       size_t len, size_t chunk_size) {
+  std::shared_lock<std::shared_mutex> access(sdk_mutex_);
+  if (partition_closing_)
+    throw std::runtime_error("Mooncake partition is closing");
   (void)chunk_size;
   ensure_registered(buf, len);
   int64_t bytes_read = conn.client->get_into(key, buf, len);
@@ -85,6 +134,9 @@ void MooncakeConnector::do_single_get(WorkerMooncakeConn& conn,
 void MooncakeConnector::do_single_set(WorkerMooncakeConn& conn,
                                       const std::string& key, const void* buf,
                                       size_t len, size_t chunk_size) {
+  std::shared_lock<std::shared_mutex> access(sdk_mutex_);
+  if (partition_closing_)
+    throw std::runtime_error("Mooncake partition is closing");
   (void)chunk_size;
   ensure_registered(buf, len);
   int rc = conn.client->put_from(key, const_cast<void*>(buf), len);
@@ -95,6 +147,9 @@ void MooncakeConnector::do_single_set(WorkerMooncakeConn& conn,
 
 bool MooncakeConnector::do_single_exists(WorkerMooncakeConn& conn,
                                          const std::string& key) {
+  std::shared_lock<std::shared_mutex> access(sdk_mutex_);
+  if (partition_closing_)
+    throw std::runtime_error("Mooncake partition is closing");
   // isExist returns: 1=exists, 0=not, -1=error
   int result = conn.client->isExist(key);
   if (result < 0) {
@@ -108,6 +163,9 @@ bool MooncakeConnector::do_single_exists(WorkerMooncakeConn& conn,
 
 bool MooncakeConnector::do_single_delete(WorkerMooncakeConn& conn,
                                          const std::string& key) {
+  std::shared_lock<std::shared_mutex> access(sdk_mutex_);
+  if (partition_closing_)
+    throw std::runtime_error("Mooncake partition is closing");
   int rc = conn.client->remove(key, /*force=*/true);
   if (rc != 0) {
     fprintf(stderr,
@@ -118,7 +176,9 @@ bool MooncakeConnector::do_single_delete(WorkerMooncakeConn& conn,
   return true;
 }
 
-void MooncakeConnector::on_workers_stopped() { unregister_all_buffers(); }
+void MooncakeConnector::on_workers_stopped() {
+  if (!partition_controls_) unregister_all_buffers();
+}
 
 size_t MooncakeConnector::choose_num_tiles(Op op, size_t num_items) const {
   (void)op;
@@ -130,6 +190,9 @@ size_t MooncakeConnector::choose_num_tiles(Op op, size_t num_items) const {
 
 void MooncakeConnector::do_batch_get(WorkerMooncakeConn& conn,
                                      const Request& req) {
+  std::shared_lock<std::shared_mutex> access(sdk_mutex_);
+  if (partition_closing_)
+    throw std::runtime_error("Mooncake partition is closing");
   // Keep GET tolerant at per-key granularity: registration failures should
   // only zero that key. Keep the no-failure path on Mooncake's batch API, and
   // fall back to ConnectorBase's singleton-style handling on error.
@@ -141,6 +204,7 @@ void MooncakeConnector::do_batch_get(WorkerMooncakeConn& conn,
               "[LMCache GET] Mooncake buffer registration failed for key %zu, "
               "falling back to per-key get: %s\n",
               i, e.what());
+      access.unlock();
       ConnectorBase<WorkerMooncakeConn>::do_batch_get(conn, req);
       return;
     }
@@ -165,6 +229,9 @@ void MooncakeConnector::do_batch_get(WorkerMooncakeConn& conn,
 
 void MooncakeConnector::do_batch_set(WorkerMooncakeConn& conn,
                                      const Request& req) {
+  std::shared_lock<std::shared_mutex> access(sdk_mutex_);
+  if (partition_closing_)
+    throw std::runtime_error("Mooncake partition is closing");
   for (size_t i = 0; i < req.buf_ptrs.size(); ++i) {
     ensure_registered(req.buf_ptrs[i], req.buf_lens[i]);
   }
@@ -183,6 +250,9 @@ void MooncakeConnector::do_batch_set(WorkerMooncakeConn& conn,
 
 void MooncakeConnector::do_batch_exists(WorkerMooncakeConn& conn,
                                         const Request& req) {
+  std::shared_lock<std::shared_mutex> access(sdk_mutex_);
+  if (partition_closing_)
+    throw std::runtime_error("Mooncake partition is closing");
   auto results = conn.client->batchIsExist(req.keys);
   ensure_batch_result_size(results, req.keys.size(), "batchIsExist");
 
@@ -201,6 +271,9 @@ void MooncakeConnector::do_batch_exists(WorkerMooncakeConn& conn,
 
 void MooncakeConnector::do_batch_delete(WorkerMooncakeConn& conn,
                                         const Request& req) {
+  std::shared_lock<std::shared_mutex> access(sdk_mutex_);
+  if (partition_closing_)
+    throw std::runtime_error("Mooncake partition is closing");
   auto results = conn.client->batchRemove(req.keys, /*force=*/true);
   ensure_batch_result_size(results, req.keys.size(), "batchRemove");
 
@@ -218,6 +291,21 @@ void MooncakeConnector::do_batch_delete(WorkerMooncakeConn& conn,
 }
 
 void MooncakeConnector::ensure_registered(const void* buf, size_t len) {
+  if (partition_controls_) {
+    const auto address = reinterpret_cast<std::uintptr_t>(buf);
+    if (!address || !len ||
+        len > std::numeric_limits<std::uintptr_t>::max() - address) {
+      throw std::runtime_error("Invalid Mooncake local buffer range");
+    }
+    for (const auto& [id, region] : local_buffers_) {
+      if (region.state == LocalBufferState::REGISTERED &&
+          address >= region.base && address - region.base < region.size &&
+          len <= region.size - (address - region.base))
+        return;
+    }
+    throw std::runtime_error(
+        "Mooncake buffer has no active local registration");
+  }
   if (!l1_registration_.is_valid()) {
     return;
   }
@@ -317,6 +405,226 @@ void MooncakeConnector::unregister_all_buffers() noexcept {
   }
 
   preregistered_block_size_ = 0;
+}
+
+PartitionStatus MooncakeConnector::partition_status() const {
+  std::lock_guard<std::mutex> guard(status_mutex_);
+  return partition_status_;
+}
+
+PartitionControlResult MooncakeConnector::control_result(
+    PartitionControlCode code, int sdk_error) const {
+  PartitionControlResult result;
+  result.code = code;
+  result.sdk_error = sdk_error;
+  result.snapshot = partition_status();
+  return result;
+}
+
+PartitionControlCode MooncakeConnector::control_admission() const {
+  if (!partition_controls_) return PartitionControlCode::UNSUPPORTED;
+  if (partition_closing_) return PartitionControlCode::CLOSED;
+  return PartitionControlCode::SUCCESS;
+}
+
+void MooncakeConnector::validate_partition_config() const {
+#ifndef MOONCAKE_FENCED_TCP_OWNERSHIP_API
+  throw std::runtime_error("Partition controls require the fenced CPU TCP SDK");
+#else
+  auto configured = [&](const char* key, const char* value) {
+    auto found = config_.find(key);
+    return found != config_.end() && found->second == value;
+  };
+  const char* strict = std::getenv("MC_TCP_REQUIRE_GENERATION");
+  const char* nof = std::getenv("MC_NOF_BACKEND");
+  const char* hot_cache = std::getenv("MC_STORE_LOCAL_HOT_CACHE_SIZE");
+  if (!configured("protocol", "tcp") ||
+      !configured("global_segment_size", "0") || !strict ||
+      std::string(strict) != "1" || !nof || std::string(nof) != "none" ||
+      (hot_cache && std::string(hot_cache) != "0") ||
+      l1_registration_.enabled) {
+    throw std::invalid_argument(
+        "Partition mode requires strict CPU TCP, zero setup shared bytes, "
+        "MC_NOF_BACKEND=none, no hot cache, and dynamic L1 registration");
+  }
+  for (const char* key : {"ipc_socket_path", "ssd_offload_path"}) {
+    auto found = config_.find(key);
+    if (found != config_.end() && !found->second.empty()) {
+      throw std::invalid_argument("Partition mode forbids IPC and file mounts");
+    }
+  }
+  auto offload = config_.find("enable_ssd_offload");
+  if (offload != config_.end() && offload->second != "false" &&
+      offload->second != "0") {
+    throw std::invalid_argument("Partition mode forbids SSD offload");
+  }
+#endif
+}
+
+void MooncakeConnector::refresh_partition_status() {
+  PartitionStatus snapshot;
+  snapshot.closing = partition_closing_;
+  snapshot.allocation_granularity_bytes = facebook::cachelib::Slab::kSize;
+  for (const auto& [id, buffer] : local_buffers_)
+    snapshot.local_buffers.push_back(buffer);
+#ifdef MOONCAKE_FENCED_TCP_OWNERSHIP_API
+  const auto owned = client_->GetFencedTcpOwnershipSnapshot();
+  snapshot.enabled = partition_controls_ && owned.version == 1 && owned.enabled;
+  snapshot.closed = owned.closed;
+  snapshot.scratch_bytes = owned.scratch_bytes;
+  snapshot.retained_failed_bytes = owned.failed_allocation_bytes;
+  for (const auto& segment : owned.allocated_segments) {
+    snapshot.shared_segments.push_back(
+        {segment.id, segment.base, segment.bytes});
+    snapshot.shared_allocated_bytes += segment.bytes;
+  }
+#endif
+  std::lock_guard<std::mutex> guard(status_mutex_);
+  partition_status_ = std::move(snapshot);
+}
+
+PartitionControlResult MooncakeConnector::register_l1_buffer(
+    std::uintptr_t base, size_t size) {
+  std::unique_lock<std::shared_mutex> access(sdk_mutex_, std::try_to_lock);
+  if (!access.owns_lock()) return control_result(PartitionControlCode::BUSY);
+  const auto admission = control_admission();
+  if (admission != PartitionControlCode::SUCCESS)
+    return control_result(admission);
+  if (!base || !size ||
+      size > std::numeric_limits<std::uintptr_t>::max() - base) {
+    return control_result(PartitionControlCode::INVALID);
+  }
+  for (const auto& [id, buffer] : local_buffers_) {
+    if (base == buffer.base && size == buffer.size &&
+        buffer.state == LocalBufferState::REGISTERED) {
+      auto result = control_result(PartitionControlCode::SUCCESS);
+      result.local_buffer_id = id;
+      return result;
+    }
+    if (base < buffer.base + buffer.size && buffer.base < base + size) {
+      return control_result(PartitionControlCode::INVALID);
+    }
+  }
+  for (const auto& segment : partition_status().shared_segments) {
+    if (base < segment.base + segment.size && segment.base < base + size) {
+      return control_result(PartitionControlCode::INVALID);
+    }
+  }
+  const uint64_t id = next_registration_id_++;
+  local_buffers_.emplace(
+      id, LocalBufferRegistration{id, base, size, LocalBufferState::RETAINED});
+  const int rc = control_sdk_call([&] {
+    return client_->register_buffer(reinterpret_cast<void*>(base), size);
+  });
+  if (rc == 0) local_buffers_.at(id).state = LocalBufferState::REGISTERED;
+  refresh_partition_status();
+  auto result = control_result(
+      rc == 0 ? PartitionControlCode::SUCCESS : PartitionControlCode::SDK_ERROR,
+      rc);
+  result.local_buffer_id = id;
+  return result;
+}
+
+PartitionControlResult MooncakeConnector::unregister_l1_buffer(uint64_t id) {
+  std::unique_lock<std::shared_mutex> access(sdk_mutex_, std::try_to_lock);
+  if (!access.owns_lock()) return control_result(PartitionControlCode::BUSY);
+  const auto admission = control_admission();
+  if (admission != PartitionControlCode::SUCCESS)
+    return control_result(admission);
+  auto found = local_buffers_.find(id);
+  if (found == local_buffers_.end())
+    return control_result(PartitionControlCode::INVALID);
+  found->second.state = LocalBufferState::RETAINED;
+  const int rc = control_sdk_call([&] {
+    return client_->unregister_buffer(
+        reinterpret_cast<void*>(found->second.base));
+  });
+  if (rc == 0) local_buffers_.erase(found);
+  refresh_partition_status();
+  auto result = control_result(
+      rc == 0 ? PartitionControlCode::SUCCESS : PartitionControlCode::SDK_ERROR,
+      rc);
+  result.local_buffer_id = id;
+  return result;
+}
+
+PartitionControlResult MooncakeConnector::allocate_shared_segment(size_t size) {
+  std::unique_lock<std::shared_mutex> access(sdk_mutex_, std::try_to_lock);
+  if (!access.owns_lock()) return control_result(PartitionControlCode::BUSY);
+  const auto admission = control_admission();
+  if (admission != PartitionControlCode::SUCCESS)
+    return control_result(admission);
+  const size_t alignment = facebook::cachelib::Slab::kSize;
+  if (!size || size > std::numeric_limits<size_t>::max() - (alignment - 1)) {
+    return control_result(PartitionControlCode::INVALID);
+  }
+  {
+    std::lock_guard<std::mutex> guard(status_mutex_);
+    partition_status_.pending_shared_bytes =
+        ((size + alignment - 1) / alignment) * alignment;
+  }
+  std::vector<std::string> ids;
+  const int rc = control_sdk_call(
+      [&] { return client_->allocateAndMountSegment(size, "tcp", "*", ids); });
+  refresh_partition_status();
+  auto result = control_result(
+      rc == 0 ? PartitionControlCode::SUCCESS : PartitionControlCode::SDK_ERROR,
+      rc);
+  result.segment_ids = std::move(ids);
+  return result;
+}
+
+PartitionControlResult MooncakeConnector::release_shared_segment(
+    const std::string& id) {
+  std::unique_lock<std::shared_mutex> access(sdk_mutex_, std::try_to_lock);
+  if (!access.owns_lock()) return control_result(PartitionControlCode::BUSY);
+  const auto admission = control_admission();
+  if (admission != PartitionControlCode::SUCCESS)
+    return control_result(admission);
+  const auto before = partition_status();
+  const auto found =
+      std::find_if(before.shared_segments.begin(), before.shared_segments.end(),
+                   [&](const auto& segment) { return segment.id == id; });
+  if (found == before.shared_segments.end())
+    return control_result(PartitionControlCode::INVALID);
+  const int rc =
+      control_sdk_call([&] { return client_->unmountAndFreeSegment({id}, 0); });
+  refresh_partition_status();
+  auto result = control_result(
+      rc == 0 ? PartitionControlCode::SUCCESS : PartitionControlCode::SDK_ERROR,
+      rc);
+  result.segment_ids = {id};
+  result.released_shared_bytes =
+      before.shared_allocated_bytes - result.snapshot.shared_allocated_bytes;
+  return result;
+}
+
+PartitionControlResult MooncakeConnector::close_partition() {
+  if (!partition_controls_)
+    return control_result(PartitionControlCode::UNSUPPORTED);
+  std::unique_lock<std::mutex> closing(close_mutex_, std::try_to_lock);
+  if (!closing.owns_lock()) return control_result(PartitionControlCode::BUSY);
+  std::unique_lock<std::shared_mutex> access(sdk_mutex_, std::try_to_lock);
+  if (!access.owns_lock()) return control_result(PartitionControlCode::BUSY);
+  if (partition_status().closed)
+    return control_result(PartitionControlCode::SUCCESS);
+  partition_closing_ = true;
+  refresh_partition_status();
+  access.unlock();
+  ConnectorBase<WorkerMooncakeConn>::close();
+  access.lock();
+  const auto before = partition_status();
+  const int rc = control_sdk_call([&] { return client_->tearDownAll(); });
+  if (rc == 0) local_buffers_.clear();
+  refresh_partition_status();
+  auto result = control_result(
+      rc == 0 ? PartitionControlCode::SUCCESS : PartitionControlCode::SDK_ERROR,
+      rc);
+  result.released_shared_bytes = before.shared_allocated_bytes +
+                                 before.retained_failed_bytes -
+                                 result.snapshot.shared_allocated_bytes -
+                                 result.snapshot.retained_failed_bytes;
+  return result;
 }
 
 }  // namespace connector
