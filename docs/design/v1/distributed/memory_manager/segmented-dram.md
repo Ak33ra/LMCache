@@ -15,6 +15,11 @@ There is no extra alignment allocation or hidden mapped page.
 Both active and draining segments contribute to mapped backing. A segment
 contributes to `get_active_capacity()` only while it admits allocations.
 Neither counter measures RSS, page residency, or transfer registration.
+`DRAMSegmentStatus` exposes `base` and `mapped_bytes` for explicit dynamic
+registration. The address stays stable through ACTIVE and DRAINING, including
+failed removal while views survive, and becomes zero only after removal.
+A status snapshot is metadata, not a lifetime lease. The caller must drain
+operations and unregister the native range before asking to remove it.
 memfd pages are faulted on access and can be swapped by the OS. No page-locking
 or GPU registration is performed.
 

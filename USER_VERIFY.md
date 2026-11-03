@@ -192,6 +192,7 @@ view = objects[0].raw_tensor
 view.fill_(73)
 pool.begin_drain(segment.handle)
 pool.free(objects)
+print('registration range:', hex(segment.base), segment.mapped_bytes)
 print('held view:', pool.remove_segment(segment.handle))
 print('usage:', pool.get_memory_usage())
 assert torch.all(view == 73)
@@ -204,7 +205,8 @@ PY
 ```
 
 While the Python view survives, expect DRAINING and usage `(0, 4096)` on a
-4 KiB-page host. After `del view`, expect REMOVED and `(0, 0)`. The caller in
+4 KiB-page host. Its base address must remain unchanged. After `del view`,
+expect REMOVED, base zero, and `(0, 0)`. The caller in
 this example has no outstanding native operation. A raw native pointer can
 outlive both the L1 TTL and its Python tensor, so this check does not establish
 transfer-completion safety. Shared Store handoff, two-host operation, GPU,

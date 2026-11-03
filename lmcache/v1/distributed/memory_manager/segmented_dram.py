@@ -63,6 +63,8 @@ class DRAMSegmentStatus:
     ``mapped_bytes`` is zero for a retired handle. ``used_bytes`` counts aligned
     allocations, not native accesses or resident pages. ``mapping_name`` can be
     matched against Linux ``/proc/self/maps``; it is empty after removal.
+    ``base`` is the mapped address, including during a blocked removal, and
+    zero after removal. The snapshot does not pin the mapping or its contents.
     """
 
     handle: DRAMSegmentHandle
@@ -71,6 +73,7 @@ class DRAMSegmentStatus:
     used_bytes: int
     active_allocations: int
     mapping_name: str
+    base: int
 
 
 class _DRAMSegment(TensorMemoryAllocator):
@@ -97,6 +100,7 @@ class _DRAMSegment(TensorMemoryAllocator):
         buffer = (ctypes.c_ubyte * size).from_buffer(self.mapping)
         try:
             self.buffer = torch.frombuffer(buffer, dtype=torch.uint8)
+            self.base = self.buffer.data_ptr()
         except (RuntimeError, MemoryError, ValueError):
             del buffer
             self.mapping.close()
@@ -131,6 +135,7 @@ class _DRAMSegment(TensorMemoryAllocator):
             self.total_allocated_size,
             self.num_active_allocations,
             self.mapping_name,
+            self.base,
         )
 
 
@@ -290,7 +295,7 @@ class SegmentedDRAML1MemoryManager:
             segment = self._find_segment(handle)
             if segment is not None:
                 return segment.status()
-            return DRAMSegmentStatus(handle, DRAMSegmentState.REMOVED, 0, 0, 0, "")
+            return DRAMSegmentStatus(handle, DRAMSegmentState.REMOVED, 0, 0, 0, "", 0)
 
     def get_segment_statuses(self) -> list[DRAMSegmentStatus]:
         """Return all mapped segments, including draining ones, in add order."""

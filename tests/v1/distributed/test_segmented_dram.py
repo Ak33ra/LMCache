@@ -58,7 +58,9 @@ def test_exact_mapping_and_full_capacity_roundtrip() -> None:
         assert pool.get_memory_usage() == (0, 3 * PAGE)
         error, objects = pool.allocate(_layout(3 * PAGE), 1)
         assert error is L1Error.SUCCESS
-        assert objects[0].data_ptr % PAGE == 0
+        assert segment.base != 0 and segment.base % PAGE == 0
+        assert objects[0].data_ptr == segment.base
+        assert objects[0].get_size() == segment.mapped_bytes
         tensor = objects[0].raw_tensor
         assert tensor is not None
         expected = torch.arange(3 * PAGE, dtype=torch.int64).to(torch.uint8)
@@ -72,6 +74,7 @@ def test_exact_mapping_and_full_capacity_roundtrip() -> None:
         del tensor
         removed = pool.remove_segment(segment.handle)
         assert removed.state is DRAMSegmentState.REMOVED
+        assert removed.base == 0
         assert pool.get_memory_usage() == (0, 0)
         assert _mapped_bytes(segment.mapping_name) == 0
         assert _descriptor_count(segment.mapping_name) == 0
@@ -90,7 +93,10 @@ def test_python_view_blocks_release_after_logical_free() -> None:
     pool.begin_drain(segment.handle)
     pool.free(objects)
     assert pool.get_memory_usage() == (0, PAGE)
-    assert pool.remove_segment(segment.handle).state is DRAMSegmentState.DRAINING
+    retained = pool.remove_segment(segment.handle)
+    assert retained.state is DRAMSegmentState.DRAINING
+    assert retained.base == segment.base == tensor.data_ptr()
+    assert retained.mapped_bytes == PAGE
     assert _mapped_bytes(segment.mapping_name) == PAGE
     assert torch.all(tensor == 77)
     del tensor
