@@ -121,3 +121,89 @@ uvx ruff@0.11.7 format --check examples/multi_process/cpu_inline_roundtrip.py \
 uvx isort@6.0.1 --check-only examples/multi_process/cpu_inline_roundtrip.py \
   tests/v1/distributed/test_{l1_manager,l1_memory_manager,store_controller,prefetch_controller}.py
 ```
+
+## U2. Two MP servers with native Mooncake Store
+
+This isolated experiment requires the CPU native Mooncake binding and master
+built against SDK 0.3.14 at `e1ea5d31bb5e46ff2df9f90e7c2fbaf52fcdee8c`.
+The recorded binding is
+`/home/akira/kvc-partitioning/LMCache/lmcache/lmcache_mooncake.cpython-312-x86_64-linux-gnu.so`.
+Its runtime path resolves the CPU SDK library built beside the master below;
+the Mooncake wheel is not used. Keep the U0 CPU environment exports.
+
+Run each command with a fresh evidence directory. The helper also works from
+the outer project's experiment directory when `PYTHONPATH` names this LMCache
+checkout, since it imports the reusable inline helper through `examples`.
+
+```bash
+timeout 180s python examples/multi_process/mooncake_two_server.py \
+  --master-bin /scratch/akira/kvc-mooncake-0.3.14/build/mooncake-store/src/mooncake_master \
+  --store-policy default --output-dir /tmp/kvc-two-mp-default
+timeout 180s python examples/multi_process/mooncake_two_server.py \
+  --master-bin /scratch/akira/kvc-mooncake-0.3.14/build/mooncake-store/src/mooncake_master \
+  --store-policy skip_l1 --output-dir /tmp/kvc-two-mp-skip-l1
+```
+
+Each run starts its own master and two separate MP HTTP/TCP server processes.
+Each MP configures a 64 MiB eager private pool, a 64 MiB shared Store segment,
+and a 16 MiB SDK buffer. The resulting configured cache/SDK budget is 144 MiB
+per MP, excluding process, transport, and metadata overhead. Master RPC,
+metadata, and admin endpoints and both MP endpoints use explicit distinct
+ports. SDK endpoint advertisement uses `MC_TCP_BIND_ADDRESS=127.0.0.1`;
+the pinned SDK's TCP listener still binds `INADDR_ANY`.
+
+A publishes two float32 chunks of shape `(2, 2, 8, 4)` before B starts, making
+A's segment the only possible shared placement. The helper checks the actual
+published replica endpoints before fetching through B. This sequence matters
+because the current connector's default batch put supplies no placement
+preference; `local_first` alone did not reliably place objects on A when both
+segments were mounted. Each chunk has 512 payload bytes and occupies a
+4096-byte private allocation. The shared allocator charged 1024 bytes total.
+
+The helper waits for actual Store publication and controller quiescence,
+overwrites A's original client tensors, and verifies exact bytes through B.
+It clears A's private copy and verifies a second shared fetch. It then deletes
+the shared objects through the public tier-specific HTTP API, waits for an
+empty master namespace, and checks B's private behavior:
+
+| Store policy | Prefetch policy | Private objects after read | B after shared deletion |
+| --- | --- | --- | --- |
+| `default` | `retain` | 2 per server, 8192 bytes each | exact original bytes |
+| `skip_l1` | `default` | 0 per server | miss |
+
+The master's read-only batch metadata API confirms that private reads and
+private clear/refetch leave shared replica addresses unchanged. Final checks
+require no private objects, no read/write locks or staging bytes, no pending
+store work, no shared keys, and zero shared allocator usage. Both private
+and shared backing capacities remain 64 MiB per MP throughout.
+
+Each run ends with three `PASS` lines. The second reports retained private
+objects per server, `2` for `default` and `0` for `skip_l1`. The last is:
+
+```text
+PASS: all owned service processes exited; logs and allocation counters saved
+```
+
+Evidence includes exact child commands, native/source provenance, master
+version, shared replica descriptors, private status snapshots, shared segment
+inventories, service logs, and exit statuses. `manifest.json` records the
+executed harness SHA256 and the imported LMCache checkout's source commit.
+`summary.json` contains expected and observed values and is marked successful
+only after all owned children are reaped. Inspect it with
+`python -m json.tool /tmp/kvc-two-mp-default/summary.json`.
+The master exits `0`; the MP
+HTTP servers log completed application shutdown and exit `-15` because
+Uvicorn re-raises SIGTERM. No service required SIGKILL in the recorded runs.
+An injected client-factory failure after MP readiness also reaped that MP
+and the master, with the same exit statuses.
+
+Recorded passing on 2026-11-03 with the U0 environment. Evidence directories
+are `/tmp/kvc-two-mp-default-07`, `/tmp/kvc-two-mp-skip-l1-03`, and
+`/tmp/kvc-two-mp-client-failure-01` for the failure cleanup check.
+
+This verifies independent private/shared copies and actual cross-process
+Store bytes on one host. It does not prove network isolation, cross-host
+behavior, inference integration, capacity exhaustion, concurrent admission,
+crash recovery, active-transfer cancellation, operation lifetime safety,
+transport fencing, physical backing release, or online resizing. Inline
+store acknowledgment alone is not used as shared-admission evidence.
