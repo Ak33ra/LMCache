@@ -163,10 +163,11 @@ class L1EvictionController(EvictionController):
 
         while not self._stop_flag.is_set():
             time.sleep(1)
-            used_bytes, total_bytes = self._l1_manager.get_memory_usage()
+            self._l1_manager.reclaim_temporary_objects()
+            used_bytes, total_bytes = self._l1_manager.get_eviction_pressure()
             if self._eviction_config.extra_logging_enabled:
-                self._maybe_log_memory_usage(used_bytes, total_bytes)
-            usage = 0 if total_bytes == 0 else used_bytes / total_bytes
+                self._maybe_log_memory_usage(*self._l1_manager.get_memory_usage())
+            usage = used_bytes / total_bytes if total_bytes else float(used_bytes > 0)
             if usage < watermark:
                 logger.debug(
                     "L1 memory usage %.2f below watermark %.2f; skipping eviction.",

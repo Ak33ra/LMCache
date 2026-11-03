@@ -15,7 +15,7 @@ import torch
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.config import L1ManagerConfig, L1MemoryManagerConfig
 from lmcache.v1.distributed.error import L1Error
-from lmcache.v1.distributed.internal_api import L1WriteOperation
+from lmcache.v1.distributed.internal_api import L1WriteOperation, L1WriteRetention
 from lmcache.v1.distributed.l1_manager import L1Manager
 
 LAYOUT = MemoryLayoutDesc([torch.Size([1024])], [torch.float32])
@@ -37,7 +37,9 @@ def manager() -> Iterator[L1Manager]:
 
 def reserve(manager: L1Manager, tag: str = "load") -> L1WriteOperation:
     """Reserve a destination and require its capability."""
-    error, handle = manager.reserve_write_operations([KEY], [False], LAYOUT, tag)[KEY]
+    error, handle = manager.reserve_write_operations(
+        [KEY], [L1WriteRetention.RETAIN], LAYOUT, tag
+    )[KEY]
     assert error == L1Error.SUCCESS and handle is not None
     return handle
 
