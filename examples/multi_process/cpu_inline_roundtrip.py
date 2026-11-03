@@ -193,17 +193,21 @@ def main() -> None:
             stdout=server_log,
             stderr=subprocess.STDOUT,
         )
-        client = RequestClientFactory.create(f"tcp://127.0.0.1:{port}")
         try:
-            if client.get_chunk_size().result(timeout=30) != CHUNK_SIZE:
-                raise RuntimeError("Server chunk geometry does not match the client")
-            verify_inline_roundtrip(client)
+            client = RequestClientFactory.create(f"tcp://127.0.0.1:{port}")
+            try:
+                if client.get_chunk_size().result(timeout=30) != CHUNK_SIZE:
+                    raise RuntimeError(
+                        "Server chunk geometry does not match the client"
+                    )
+                verify_inline_roundtrip(client)
+            finally:
+                client.close()
         except Exception:
             server_log.seek(0)
             sys.stderr.write(server_log.read())
             raise
         finally:
-            client.close()
             server.terminate()
             try:
                 server.wait(timeout=15)
