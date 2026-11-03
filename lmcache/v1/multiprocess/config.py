@@ -18,6 +18,7 @@ from lmcache.v1.multiprocess.ext_server_module import (
     ExtServerModuleSpec,
     parse_server_module_specs,
 )
+from lmcache.v1.multiprocess.transport.request_limits import RequestLimits
 
 logger = init_logger(__name__)
 
@@ -165,6 +166,9 @@ class MPServerConfig:
 
     server_modules: list[ExtServerModuleSpec] = field(default_factory=list)
     """Out-of-tree ``DiscoverableModule`` classes to import explicitly."""
+
+    request_limits: RequestLimits | None = None
+    """Internal opt-in CPU request bounds, separate from cache capacity."""
 
     def __post_init__(self) -> None:
         """Validate the chunk size and worker-reaping timeouts.

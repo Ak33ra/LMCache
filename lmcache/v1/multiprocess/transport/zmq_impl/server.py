@@ -113,6 +113,7 @@ def build_zmq_request_server(
     server = MessageQueueServer(
         bind_url=f"tcp://{mp_config.host}:{mp_config.port}",
         context=zmq.Context.instance(),
+        limits=mp_config.request_limits,
     )
     all_specs = [spec for module in modules for spec in get_zmq_handler_specs(module)]
     for spec in all_specs:

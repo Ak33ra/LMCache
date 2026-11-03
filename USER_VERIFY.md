@@ -696,3 +696,30 @@ the unchanged invalid code-block directive. The log is
 The repaired source also built against stock 0.3.14 as API 0 and passed its
 real-master default constructor set/get/delete byte check. Logs are
 `/tmp/kvc-native-queue-stock-build.log` and `/tmp/kvc-native-queue-stock.log`.
+
+## U-RPC. Bounded accepted CPU request work
+
+From this checkout and the environment above:
+
+```bash
+python -m pytest --confcutdir=tests/v1 -o addopts='' -o log_cli=false -q \
+  tests/v1/multiprocess/test_request_limits.py
+```
+
+The test runs real loopback TCP ZMQ sockets, with 1 KiB wire and 2 KiB tensor
+workspace limits and two accepted requests. It uses barriers to prove running
+and queued handlers share the limit, then checks refusal, handler failures,
+oversized responses, credit reuse, and shutdown waiting for access to finish.
+No Mooncake service, GPU, mock transport, or performance measurement is involved.
+
+The [request-bounds design](docs/design/v1/multiprocess/transport/request-bounds.md)
+explains the accounting scope and the required typed-inline workspace checks.
+The feature remains opt-in through internal `MPServerConfig.request_limits`.
+This unit does not activate partitioning or bound process RSS.
+
+Recorded 2026-11-03 using Python 3.12.13 and the prepared CPU environment.
+The focused suite passed **12 tests**, with no skips. A separate selected legacy
+MQ regression run plus the first ten bounds cases passed **29 tests**, with
+nine unrelated tests deselected. Ruff lint/format, isort, and `git diff --check`
+passed for changed Python files. The documentation is internal Markdown; no
+Sphinx build or live Mooncake integration is claimed for this unit.
