@@ -1151,19 +1151,17 @@ class L1Manager(L1ManagerInterface):
             key: The object key to check.
 
         Returns:
-            True if the key has a resident object that is not read-locked,
-            or a staging object whose write lock expired; False otherwise.
+            True if the key exists and no resident or staging allocation
+            has a live lock or operation; False otherwise.
         """
         entry = self._objects.get(key, None)
-        if entry is not None and entry.read_operations:
+        if entry is not None and (entry.read_operations or entry.read_lock.is_locked()):
             return False
-        if entry is not None and not entry.read_lock.is_locked():
-            return True
         per_tag = self._staging.get(key, None)
         if per_tag is None:
-            return False
+            return entry is not None
         # Snapshot: this runs without the manager lock.
-        return any(
+        return all(
             not staged.write_operation and not staged.write_lock.is_locked()
             for staged in list(per_tag.values())
         )
