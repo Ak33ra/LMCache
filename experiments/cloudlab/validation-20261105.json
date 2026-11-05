@@ -1,0 +1,191 @@
+{
+  "date": "2026-11-05",
+  "scope": "one-host-container-emulation",
+  "physical_cloudlab_run": false,
+  "release": "c2f5bc563815d5e312cf",
+  "lmcache_head": "3e305df16fb63abe70e0dd8b24067d6b89bcafec",
+  "source_manifest": {
+    "files": {
+      "LMCache.bundle": "40b3f3ba78394508245e81213626d14c04a005a87205e1d86ff1071a0a722704",
+      "experiments/cloudlab/baseline.sh": "9fa74c71ddf89d8848e755a223266b5ecd76737cd566a53ade7cdd0ffd8485a4",
+      "experiments/cloudlab/bootstrap.sh": "ebdba58a2a8c990e1a43d324635739244756fbc2693c8387853dc92ed905c4bc",
+      "experiments/cloudlab/node.py": "39e5e90be27418b7fac327cda7f8df6cd94dc5c8e3b63476a225339659a9e0eb",
+      "experiments/cloudlab/requirements.lock": "4f4458aa34c0e44d1ee622210bc8a9ed2ff9577191b311f68f66e069b73c87a8",
+      "experiments/mooncake/build_fenced_sdk.sh": "22115de9745cc6451dea835c05d75b76111406a6e7e5b335347f3623646b4588",
+      "experiments/mooncake/sdk-patches/expected-tree.txt": "dad6d9daab246093c0395f22d842e3e8f5a3813c0b7724513c7081a7c534e6c4",
+      "experiments/mooncake/sdk-patches/fenced-tcp.patch": "d093e7a11d5ba010fe179bc8eb3c7931862ee4441fa1f56d8b24fc773d34ec99",
+      "experiments/partitioning/partition_roundtrip.py": "bda3580a02d5377c702673f0540e47e264c6ece9f10e897d3e7715a2b710e828",
+      "experiments/partitioning/process_host.py": "b63b16a9d46c6c852d070ffb2f12c99a75818790d976f72bea62cb1e8b020cd6"
+    },
+    "lmcache_head": "3e305df16fb63abe70e0dd8b24067d6b89bcafec"
+  },
+  "setup": {
+    "outcome": "PASSED",
+    "release": "c2f5bc563815d5e312cf",
+    "scope": "fresh CPU setup"
+  },
+  "setup_reuse_preserved_build_records": true,
+  "baseline": {
+    "outcome": "PASSED",
+    "hosts": {
+      "node0": {
+        "pytest": {
+          "tests": 311,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "tcp": {
+          "tests": 61,
+          "failures": 0,
+          "errors": 0,
+          "disabled": 0,
+          "skipped": 0
+        },
+        "transfer": {
+          "tests": 16,
+          "failures": 0,
+          "errors": 0,
+          "disabled": 0,
+          "skipped": 0
+        },
+        "prefetch": {
+          "tests": 6,
+          "failures": 0,
+          "errors": 0,
+          "disabled": 0,
+          "skipped": 0
+        },
+        "mapping": {
+          "tests": 4,
+          "failures": 0,
+          "errors": 0,
+          "disabled": 0,
+          "skipped": 0
+        }
+      },
+      "node1": {
+        "pytest": {
+          "tests": 311,
+          "failures": 0,
+          "errors": 0,
+          "skipped": 0
+        },
+        "tcp": {
+          "tests": 61,
+          "failures": 0,
+          "errors": 0,
+          "disabled": 0,
+          "skipped": 0
+        },
+        "transfer": {
+          "tests": 16,
+          "failures": 0,
+          "errors": 0,
+          "disabled": 0,
+          "skipped": 0
+        },
+        "prefetch": {
+          "tests": 6,
+          "failures": 0,
+          "errors": 0,
+          "disabled": 0,
+          "skipped": 0
+        },
+        "mapping": {
+          "tests": 4,
+          "failures": 0,
+          "errors": 0,
+          "disabled": 0,
+          "skipped": 0
+        }
+      }
+    }
+  },
+  "partition": {
+    "outcome": "PASSED",
+    "reads": 45,
+    "verified_chunks": 90,
+    "errors": 0,
+    "routes": {
+      "node0": [
+        {
+          "dst": "172.19.0.3",
+          "dev": "eth1",
+          "prefsrc": "172.19.0.2",
+          "flags": [],
+          "uid": 1001,
+          "cache": []
+        }
+      ],
+      "node1": [
+        {
+          "dst": "172.19.0.2",
+          "dev": "eth1",
+          "prefsrc": "172.19.0.3",
+          "flags": [],
+          "uid": 1001,
+          "cache": []
+        }
+      ]
+    }
+  },
+  "recovery": {
+    "exit_code": 0
+  },
+  "checks": {
+    "occupied-final-002": {
+      "outcome": "PASSED",
+      "cli_exit": 1,
+      "expected_outcome": "BLOCKED",
+      "sentinel_survived": true,
+      "no_services_started": true
+    },
+    "reused-run-final-001": {
+      "outcome": "PASSED",
+      "cli_exit": 1,
+      "existing_run_unchanged": true,
+      "verified_files": 438
+    },
+    "baseline-interrupt-final-001": {
+      "outcome": "PASSED",
+      "interrupted_baseline": "FAILED",
+      "node0_exit": 1,
+      "node1_never_started": true,
+      "both_hosts_stopped": true,
+      "both_hosts_collected": true
+    },
+    "ssh-lifecycle-final-001": {
+      "outcome": "PASSED",
+      "scope": "one-host-container-emulation",
+      "run_id": "ssh-lifecycle-final-001",
+      "checks": [
+        "both SSH-owned services and host-local maps",
+        "controller EOF cleans owned service",
+        "interrupted SSH and recorded recovery",
+        "repeated stop",
+        "partial service launch returns failure",
+        "logs and exit ledgers collect after partial failure"
+      ]
+    }
+  },
+  "artifacts": {
+    "setup": "/scratch/akira/kvc-cloudlab-test/wrappers/u7a_verify.06TZY8vk/setup",
+    "baseline": "/scratch/akira/kvc-cloudlab-test/wrappers/u7b_verify.3qmGrlVF/baseline",
+    "partition": "/scratch/akira/kvc-cloudlab-test/wrappers/u7c_verify.b6eGeh7k/partition",
+    "recovery": "/scratch/akira/kvc-cloudlab-test/wrappers/u7d_verify.Ocy7IX4Z/collected"
+  },
+  "native_stress_limitation": {
+    "fixture": "ConcurrentAdmissionShutdownStressPreservesLaneOwnership",
+    "default_one_worker": {
+      "passed": 10,
+      "failed": 0
+    },
+    "explicit_two_workers": {
+      "passed": 8,
+      "failed": 12
+    },
+    "status": "test-hook synchronization limitation; concurrent assertions not reached",
+    "evidence": "/scratch/akira/kvc-cloudlab-test/review-native-flake/REPORT.md"
+  }
+}

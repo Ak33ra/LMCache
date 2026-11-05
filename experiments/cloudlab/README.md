@@ -5,11 +5,51 @@ Node 0 owns the client, Mooncake master and MP A. Node 1 owns MP B. The
 workstation needs Python 3.12 or newer, Git and OpenSSH; it needs no Torch,
 CUDA or Mooncake installation. The host recipe follows [DEV.md](../../DEV.md).
 
-Use two CloudLab CPU nodes with an experiment LAN. Set their experiment IPv4
-addresses explicitly. SSH destinations are control-network aliases from your
-SSH config. Node 0 also needs ordinary, noninteractive SSH access to node 1
-using the **same node1 alias**. Set up and verify that access yourself; the
-scripts never forward agents or copy private keys. Verify host keys normally.
+Use CloudLab's [small-lan profile](https://www.cloudlab.us/example-profiles.php)
+with two bare-metal CPU nodes, Ubuntu 24.04
+(`UBUNTU24-64-STD`), and one experiment LAN. The proposed Utah `c6525-25g`
+pair is suitable for this CPU test. Give each node about 100 GB of local
+workspace at `/mydata`. The scripts do not allocate or terminate experiments.
+Set their experiment IPv4 addresses explicitly. Use control-network SSH
+destinations. Node0 must reach node1 noninteractively using the same `ssh`
+value as the workstation. The scripts honor your SSH configuration without
+enabling agent forwarding or copying private keys. Verify host keys normally.
+
+Using `YOUR_USER@CONTROL_HOST` as each `ssh` value avoids needing the same
+alias on both machines. Copy these destinations from CloudLab's **List View**.
+Use `ip -br address` on each node to identify its experiment IP. Keep the
+control-network hostname out of the `experiment_ip` fields.
+
+If node0 needs your workstation's SSH key to reach node1, load that key into
+your local agent and explicitly enable `ForwardAgent yes` for node0 in your
+workstation SSH config. For example, `~/.ssh/config` can contain:
+
+```text
+Host NODE0_CONTROL_HOST
+    ForwardAgent yes
+```
+
+Verify the peer host key in an interactive session:
+
+```bash
+ssh-add ~/.ssh/id_ed25519
+ssh -A YOUR_USER@NODE0_CONTROL_HOST
+```
+
+Then run on node0, using the same node1 destination as the inventory:
+
+```bash
+ssh YOUR_USER@NODE1_CONTROL_HOST true
+exit
+```
+
+Before deployment, confirm that the ordinary workstation SSH command has the
+access the CLI will use. Substitute the filled inventory's destinations:
+
+```bash
+ssh YOUR_USER@NODE0_CONTROL_HOST \
+  'ssh -o BatchMode=yes YOUR_USER@NODE1_CONTROL_HOST true'
+```
 
 Both hosts need passwordless `sudo` for package installation, Internet access,
 Python 3.12, and enough writable disk for the source, venv and SDK build.
@@ -27,7 +67,7 @@ python3 experiments/cloudlab/cloudlab.py --inventory cluster.json \
   run --run-id partition-001 --output-dir results/partition-001 --workload
 ```
 
-Global options precede the command. `--ssh-config PATH` selects a workstation
+`--ssh-config PATH` selects a workstation
 config; node 0 uses its own `~/.ssh/config` for its peer connection. When using
 an isolated writer checkout, set `--project-root` to the outer project and
 `--lmcache-root` to its clean engine checkout. Normal outer-project usage
@@ -42,10 +82,13 @@ native artifact hashes, build manifest and completion marker. A partial build
 cannot pass preflight. Repeating setup reuses only a verified completed build.
 
 `baseline` runs 311 CPU tests with no skips, a real local MP roundtrip, and the
-four compiled SDK suites. It deliberately unsets strict transfer flags: the
-native suites choose legacy and strict modes themselves. The live services
+four compiled SDK suites. It clears live-service transfer, bind-address, and
+I/O-thread settings so the native suites choose their own configuration. The
+native default uses one I/O worker. The live services use two I/O workers and
 set strict generation checks, disable NOF and CUDA, and remove inherited
 `LD_LIBRARY_PATH`. The CPU native extension reports partition control API 1.
+The [validation report](VALIDATION.md#native-stress-test-limitation) records
+a synchronization limitation in one native stress fixture with two workers.
 
 `run` reserves fresh directories on both nodes, checks address ownership and
 ports, and tests the node0-to-node1 SSH and experiment-LAN connection. It starts
@@ -58,10 +101,11 @@ as `SKIPPED_BY_REQUEST` for that optional step.
 The nine ports starting at `port_base` are reserved for this experiment.
 Offsets 0–2 are the master RPC, metadata and admin ports; 3–5 are A's RPC,
 HTTP and transfer handshake ports; 6–8 are B's. The SDK also opens dynamic
-TCP data ports; those nine fixed ports are not a complete firewall allowlist. All advertised, configured and dialed
-cache addresses use the experiment IPs. The pinned SDK's TCP data acceptor
-can bind wildcard despite advertising an experiment IP. This does **not**
-provide NIC isolation. Preflight and live service evidence record actual
+TCP data ports, so a firewall allowance for only those nine ports is insufficient.
+All advertised, configured and dialed cache addresses use the experiment IPs.
+The pinned SDK's TCP data acceptor can bind wildcard despite advertising an
+experiment IP. Its listener binding does not provide NIC isolation.
+Preflight and live service evidence record actual
 listeners and routes. These scripts do not change NICs, routes or firewalls.
 
 ```bash
@@ -73,12 +117,17 @@ python3 experiments/cloudlab/cloudlab.py --inventory cluster.json \
   collect --run-id partition-001 --output-dir results/recovered-001
 ```
 
-Every run ID and local output directory must be new. `status` distinguishes
+For `run` and `baseline`, use a new run ID and local output directory.
+`status` distinguishes
 absent, running, stopped and unreachable hosts. `stop` is repeatable and only
 signals recorded run-owned identities. Guardians record host, role, PID,
 process group, boot ID, start time and command hash; they clean up on control
 EOF, SSH hangup and termination. Recovery refuses uncertain or reused process
 identities. Required SIGKILL is a failed cleanup, never a passing experiment.
+
+To interrupt an active command, press Ctrl-C in the workstation terminal
+that runs it. Then use `stop` and `collect` to recover any remaining services
+and evidence. A failed baseline host stops the sequence before the next host.
 
 `run` and `baseline` use the same recorded guardians and always attempt
 cleanup and artifact collection after a failure. Remote
@@ -87,6 +136,7 @@ reports `PASSED` only when assertions, cleanup and collection all succeed;
 `FAILED` means the attempted experiment failed, and `BLOCKED` means a required
 prerequisite was unavailable. A zero exit code from setup proves a completed
 build; the separate baseline and workload commands establish their own scope.
+Failed host checks preserve their diagnostic output in `nodeN-preflight.log`.
 Node archives and extracted `node0/<run-id>` and `node1/<run-id>` directories
 include commands, logs, identity ledgers, manifests and exit records. Native
 process maps for B are read on node 1 and returned to the existing verifier.
@@ -117,3 +167,7 @@ to test the complete deployment and experiment route. Two SSH containers on
 separate control and experiment bridges constitute **one-host container
 emulation**. They establish no physical cross-host or CloudLab result. The
 serial synthetic workload makes no bandwidth or performance claim.
+
+[The design note](DESIGN.md) explains ownership and the selected alternative.
+[The validation report](VALIDATION.md) records tested versions, commands,
+results, and the remaining physical CloudLab check.
