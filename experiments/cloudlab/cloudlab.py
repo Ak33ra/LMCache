@@ -157,6 +157,8 @@ def package(project: Path, engine: Path, destination: Path) -> tuple[str, Path]:
             "git",
             "-C",
             str(engine),
+            "-c",
+            "pack.threads=1",
             "bundle",
             "create",
             str(bundle),

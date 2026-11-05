@@ -15,7 +15,7 @@ from cloudlab import SDK_FILES, load_inventory, package
 class PackagingTest(unittest.TestCase):
     """Exercise real Git source bundles and rejection of undeclared input."""
 
-    def test_bundle_contains_exact_clean_head_and_no_untracked_secret(
+    def test_bundle_is_exact_repeatable_and_excludes_untracked_files(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory(prefix="kvc-package-") as temporary:
@@ -24,9 +24,11 @@ class PackagingTest(unittest.TestCase):
             engine.mkdir()
             subprocess.run(["git", "init", "-q", str(engine)], check=True)
             (engine / "source.py").write_text('print("exact source")\n')
-            subprocess.run(
-                ["git", "-C", str(engine), "add", "source.py"], check=True
-            )
+            for index in range(256):
+                (engine / f"payload-{index:03}.txt").write_text(
+                    "shared text for delta compression\n" * 128 + str(index)
+                )
+            subprocess.run(["git", "-C", str(engine), "add", "."], check=True)
             subprocess.run(
                 [
                     "git",
@@ -50,7 +52,23 @@ class PackagingTest(unittest.TestCase):
                 path.write_text("fixture SDK input\n")
             staging = root / "staging"
             staging.mkdir()
+            subprocess.run(
+                ["git", "-C", str(engine), "config", "pack.threads", "1"],
+                check=True,
+            )
             release_id, archive_path = package(project, engine, staging)
+            repeated = root / "repeated"
+            repeated.mkdir()
+            subprocess.run(
+                ["git", "-C", str(engine), "config", "pack.threads", "4"],
+                check=True,
+            )
+            repeated_id, _ = package(project, engine, repeated)
+            self.assertEqual(release_id, repeated_id)
+            self.assertEqual(
+                (staging / "LMCache.bundle").read_bytes(),
+                (repeated / "LMCache.bundle").read_bytes(),
+            )
             with tarfile.open(archive_path) as archive:
                 archive.extractall(root / "unpacked", filter="data")
             unpacked = root / "unpacked"
