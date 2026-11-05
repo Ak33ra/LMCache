@@ -2,15 +2,15 @@
 """Verify live private/shared resizing through public MP and Store APIs."""
 
 # Standard
-from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import median
 import argparse
 import hashlib
+import json
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -46,6 +46,8 @@ from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
 import lmcache
 import lmcache.lmcache_mooncake as native_mooncake
+
+from process_host import Process, ProcessHost
 
 POOL_BYTES = 64 * 1024 * 1024
 SDK_BYTES = 8 * 1024 * 1024
@@ -140,58 +142,7 @@ def _ports(count: int) -> list[int]:
         return [sock.getsockname()[1] for sock in sockets]
 
 
-@contextmanager
-def _process(
-    name: str,
-    command: list[str],
-    output: Path,
-) -> Iterator[subprocess.Popen[bytes]]:
-    (output / f"{name}-command.json").write_bytes(msgspec.json.encode(command))
-    environment = dict(
-        os.environ,
-        CUDA_VISIBLE_DEVICES="",
-        LMCACHE_TRACK_USAGE="false",
-        MC_TCP_BIND_ADDRESS="127.0.0.1",
-        MC_NUM_TCP_IO_THREADS="2",
-        MC_TCP_REQUIRE_GENERATION="1",
-        MC_NOF_BACKEND="none",
-        LMCACHE_COORDINATOR_URL="",
-    )
-    environment.pop("MC_STORE_LOCAL_HOT_CACHE_SIZE", None)
-    environment.pop("LD_LIBRARY_PATH", None)
-    with (output / f"{name}.log").open("wb") as log:
-        process = subprocess.Popen(
-            command,
-            env=environment,
-            stdout=log,
-            stderr=log,
-            cwd=Path(lmcache.__file__).resolve().parent.parent,
-        )
-        (output / f"{name}-pid.txt").write_text(f"{process.pid}\n")
-        try:
-            yield process
-        finally:
-            process.terminate()
-            try:
-                process.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
-                raise RuntimeError(f"{name} required SIGKILL; see {output}") from None
-            (output / f"{name}-exit.txt").write_text(f"{process.returncode}\n")
-            if (
-                name != "master"
-                and "Application shutdown complete."
-                not in (output / f"{name}.log").read_text()
-            ):
-                raise RuntimeError(f"{name} did not finish graceful HTTP shutdown")
-            if process.returncode not in (0, -signal.SIGTERM):
-                raise RuntimeError(
-                    f"{name} exited with {process.returncode}; see {output}"
-                )
-
-
-def _ready(http: httpx.Client, url: str, process: subprocess.Popen[bytes]) -> None:
+def _ready(http: httpx.Client, url: str, process: Process) -> None:
     def check() -> bool:
         if process.poll() is not None:
             raise RuntimeError(f"Service exited with {process.returncode}: {url}")
@@ -215,7 +166,7 @@ class Node:
     output: Path
     instance_id: int
     shared_endpoint: str
-    process: subprocess.Popen[bytes]
+    process: Process
 
     def state(self) -> ServerState:
         """Return validated public status; raise on an HTTP or schema failure."""
@@ -303,19 +254,20 @@ def _node(
     adapter: dict[str, str | int],
     http: httpx.Client,
     output: Path,
+    host: ProcessHost,
 ) -> Node:
     rpc_port, http_port, te_port = ports
-    config = dict(adapter, local_hostname=f"127.0.0.1:{te_port}")
+    config = dict(adapter, local_hostname=f"{host.address}:{te_port}")
     command = [
         sys.executable,
         "-m",
         "lmcache.v1.multiprocess.http_server",
         "--host",
-        "127.0.0.1",
+        host.address,
         "--port",
         str(rpc_port),
         "--http-host",
-        "127.0.0.1",
+        host.address,
         "--http-port",
         str(http_port),
         "--chunk-size",
@@ -344,10 +296,10 @@ def _node(
         "--disable-observability",
         "--disable-metrics",
     ]
-    process = stack.enter_context(_process(name, command, output))
-    http_url = f"http://127.0.0.1:{http_port}"
+    process = stack.enter_context(host.service(name, command, output))
+    http_url = f"http://{host.address}:{http_port}"
     _ready(http, f"{http_url}/healthcheck", process)
-    rpc = RequestClientFactory.create(f"tcp://127.0.0.1:{rpc_port}")
+    rpc = RequestClientFactory.create(f"tcp://{host.address}:{rpc_port}")
     stack.callback(rpc.close)
     instance_id = os.getpid()
     registration = rpc.register_kv_cache_engine_driven_context(
@@ -373,7 +325,7 @@ def _node(
         http_url,
         output,
         instance_id,
-        f"127.0.0.1:{te_port}",
+        f"{host.address}:{te_port}",
         process,
     )
 
@@ -422,7 +374,7 @@ def _snapshot(node: Node, label: str) -> dict:
     status = response.json()
     if status["charged_bytes"] > TOTAL_BYTES:
         raise RuntimeError(f"Managed backing exceeded budget: {status}")
-    maps = Path(f"/proc/{node.process.pid}/maps").read_text()
+    maps = node.process.read_maps()
     (node.output / f"{node.name}-{label}.maps").write_text(maps)
     mapped = 0
     for line in maps.splitlines():
@@ -516,7 +468,7 @@ def _resize(node: Node, alpha: float, request_id: str) -> dict:
         if item["segment_id"] not in active
     ]
     ranges = []
-    for line in Path(f"/proc/{node.process.pid}/maps").read_text().splitlines():
+    for line in node.process.read_maps().splitlines():
         start, end = [int(value, 16) for value in line.split()[0].split("-")]
         ranges.append((start, end, line))
     observations = []
@@ -712,6 +664,8 @@ def main() -> None:
         type=Path,
         default=Path(lmcache.__file__).resolve().parent.parent,
     )
+    parser.add_argument("--deployment", type=Path)
+    parser.add_argument("--peer-output", type=Path)
     args = parser.parse_args()
     if torch_device_type != "cpu":
         raise RuntimeError("Run with CUDA_VISIBLE_DEVICES='' for this CPU check")
@@ -745,20 +699,35 @@ def main() -> None:
         "cpu_count": os.cpu_count(),
     }
     (args.output_dir / "manifest.json").write_bytes(msgspec.json.encode(manifest))
-    ports = _ports(9)
+    deployment = json.loads(args.deployment.read_text()) if args.deployment else None
+    local_address = deployment["node0"]["experiment_ip"] if deployment else "127.0.0.1"
+    local = ProcessHost(source, args.output_dir, local_address)
+    if deployment:
+        if args.peer_output is None:
+            parser.error("--deployment requires --peer-output")
+        peer = ProcessHost(
+            source,
+            args.peer_output,
+            deployment["node1"]["experiment_ip"],
+            ssh=deployment["node1"]["ssh"],
+        )
+        ports = list(range(deployment["port_base"], deployment["port_base"] + 9))
+    else:
+        peer = local
+        ports = _ports(9)
     rpc_port, metadata_port, admin_port = ports[:3]
-    master_url = f"http://127.0.0.1:{admin_port}"
+    master_url = f"http://{local_address}:{admin_port}"
     command = [
         str(args.master_bin.resolve()),
-        "--rpc_address=127.0.0.1",
+        f"--rpc_address={local_address}",
         f"--port={rpc_port}",
         "--rpc_thread_num=2",
         "--handler_worker_thread_num=2",
         "--enable_http_metadata_server=true",
-        "--http_metadata_server_host=127.0.0.1",
+        f"--http_metadata_server_host={local_address}",
         f"--http_metadata_server_port={metadata_port}",
         "--enable_metric_reporting=true",
-        "--metrics_host=127.0.0.1",
+        f"--metrics_host={local_address}",
         f"--metrics_port={admin_port}",
         "--enable_offload=false",
         "--enable_disk_eviction=false",
@@ -770,17 +739,17 @@ def main() -> None:
         "type": "mooncake_store",
         "num_workers": 2,
         "protocol": "tcp",
-        "metadata_server": f"http://127.0.0.1:{metadata_port}/metadata",
-        "master_server_addr": f"127.0.0.1:{rpc_port}",
+        "metadata_server": f"http://{local_address}:{metadata_port}/metadata",
+        "master_server_addr": f"{local_address}:{rpc_port}",
         "global_segment_size": "0",
         "local_buffer_size": str(SDK_BYTES),
     }
     print(f"Evidence directory: {args.output_dir}", flush=True)
     with ExitStack() as stack:
         http = stack.enter_context(httpx.Client(timeout=RPC_TIMEOUT, trust_env=False))
-        master = stack.enter_context(_process("master", command, args.output_dir))
+        master = stack.enter_context(local.service("master", command, args.output_dir))
         _ready(http, f"{master_url}/health", master)
-        a = _node(stack, "a", ports[3:6], adapter, http, args.output_dir)
+        a = _node(stack, "a", ports[3:6], adapter, http, args.output_dir, local)
         _snapshot(a, "initial")
         expected = _store(a, "initial-source")
         a.settle(0, "published")
@@ -795,7 +764,7 @@ def main() -> None:
         (args.output_dir / "initial-replicas.json").write_bytes(
             msgspec.json.encode(replicas)
         )
-        b = _node(stack, "b", ports[6:9], adapter, http, args.output_dir)
+        b = _node(stack, "b", ports[6:9], adapter, http, args.output_dir, peer)
         summary = _verify(a, b, master_url, expected)
         summary["verified_chunk_sha256"] = [
             hashlib.sha256(chunk.numpy().tobytes()).hexdigest() for chunk in expected
