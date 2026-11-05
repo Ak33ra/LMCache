@@ -9,6 +9,7 @@ cp "$release/source-manifest.json" "$release/build-manifest.json" \
     "$release/packages.txt" "$release/system-packages.txt" "$output/"
 exec > >(tee "$output/baseline.log") 2>&1
 unset LD_LIBRARY_PATH MC_TCP_REQUIRE_GENERATION MC_NOF_BACKEND
+unset MC_NUM_TCP_IO_THREADS MC_TCP_BIND_ADDRESS
 export CUDA_VISIBLE_DEVICES='' LMCACHE_TRACK_USAGE=false
 export PYTHONPATH="$release/sdk/build/python:$release/LMCache"
 export NUMBA_CACHE_DIR="$output/numba"

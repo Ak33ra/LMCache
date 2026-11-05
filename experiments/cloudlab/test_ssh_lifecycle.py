@@ -43,6 +43,7 @@ def main() -> None:
             node = getattr(inventory, name)
             ssh.run(
                 node,
+                f"mkdir -p {shlex.quote(inventory.remote_root + '/runs')} && "
                 f"mkdir {shlex.quote(directory)} && "
                 f"echo {shlex.quote(release_id)} > "
                 f"{shlex.quote(directory + '/release.txt')}",

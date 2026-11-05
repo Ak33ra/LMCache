@@ -437,7 +437,14 @@ def run(
                 "--host",
                 name,
             ]
-            response = ssh.run(node, shlex.join(check), capture_output=True)
+            try:
+                response = ssh.run(node, shlex.join(check), capture_output=True)
+            except subprocess.CalledProcessError as error:
+                log = output / f"{name}-preflight.log"
+                log.write_bytes(error.stdout + error.stderr)
+                raise RuntimeError(
+                    f"{name} preflight failed; inspect {log}"
+                ) from error
             (output / f"{name}-preflight.json").write_bytes(response.stdout)
             ssh.run(
                 node,
@@ -469,6 +476,8 @@ def run(
                 )
                 try:
                     outcome["job_exits"][name] = process.wait()
+                    if outcome["job_exits"][name] != 0:
+                        raise RuntimeError(f"{name} coordinator failed")
                 finally:
                     try:
                         process.stdin.close()
