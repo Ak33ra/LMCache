@@ -1,0 +1,6 @@
+{
+  "node0": {"ssh": "cloudlab-node0", "experiment_ip": "192.168.1.1"},
+  "node1": {"ssh": "cloudlab-node1", "experiment_ip": "192.168.1.2"},
+  "remote_root": "/mydata/kvc",
+  "port_base": 24000
+}
