@@ -664,7 +664,7 @@ class PrefetchHandle:
 
     prefetch_request_id: int
     """Opaque ID for tracking the request in the prefetch controller; -1
-    marks an already-complete empty request."""
+    marks an already-complete miss with no admitted controller request."""
 
     external_request_id: str
     """Request ID from the caller for end-to-end tracing."""

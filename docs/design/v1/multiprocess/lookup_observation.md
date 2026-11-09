@@ -11,6 +11,9 @@ The immutable receipt records the absolute hit-prefix length and per-grid-row
 counts of keys already in L1 versus keys loaded from L2. Counts come from the
 final `PrefetchResult` bitmaps, not a separate prefix fold over each source.
 An alternating L1/L2 prefix therefore retains its actual source counts.
+Partition quiescence declines new prefetch admission with zero-hit bitmaps of
+the requested row layout. Its receipt contains zero source counts per row,
+preserves any engine-covered prefix offset, and holds no cache read locks.
 
 L1 is an interface origin, not a retention policy. A hit may reuse a temporary
 buffer. L2 does not identify a physical local or remote replica. Consumers
