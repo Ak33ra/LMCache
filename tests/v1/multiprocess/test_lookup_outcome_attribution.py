@@ -122,6 +122,9 @@ def _end_metadata(
     l2_rows = l2_rows if l2_rows is not None else miss_rows
 
     ctx = MagicMock()
+    ctx.session_manager.get.return_value = (
+        ctx.session_manager.get_or_create.return_value
+    )
     # No previous lookup to settle: ``lookup`` claims any unreleased
     # result before ``begin_lookup`` resets it.
     _sess = ctx.session_manager.get_or_create.return_value

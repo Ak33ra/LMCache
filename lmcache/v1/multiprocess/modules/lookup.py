@@ -35,6 +35,7 @@ from lmcache.v1.multiprocess.kv_load_policy import (
     create_kv_load_policy,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
+from lmcache.v1.multiprocess.session import LookupObservation, Session
 from lmcache.v1.multiprocess.token_codec import num_packed_tokens, unpack_token_ids
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
@@ -103,6 +104,8 @@ class _PrefetchJob:
     # Chunk-aligned tokens LMCache was asked to look up, past the engine-covered
     # prefix (hit-rate denominator); 0 on early exits.
     requested_tokens: int
+    session: Session
+    lookup_generation: int
     num_object_groups: int = 1
     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
     # First chunk of the looked-up range (``key.start``); chunks below it are
@@ -220,14 +223,28 @@ class LookupModule(DiscoverableModule):
         )
 
         layout_desc = self._ctx.layout_desc_registry.find(model_name, world_size)
+        attn_desc = (
+            self._ctx.layout_desc_registry.find_attn_desc(model_name, world_size)
+            if layout_desc is not None
+            else None
+        )
+        session = self._ctx.session_manager.get_or_create(key.request_id)
+        session.set_tokens(key.token_bytes)
+        generation = session.begin_lookup(
+            key, tuple(attn_desc.num_chunks_in_sw) if attn_desc is not None else ()
+        )
         if layout_desc is None:
             logger.error(
                 "No GPU context found for model %s with world size %d during lookup!",
                 model_name,
                 world_size,
             )
-            self._register_empty_prefetch_job(key, early_exit_reason="no_gpu_context")
+            self._register_empty_prefetch_job(
+                key, session, generation, early_exit_reason="no_gpu_context"
+            )
             return
+
+        assert attn_desc is not None
 
         num_kv_readers = key.require_num_kv_readers()
 
@@ -236,7 +253,7 @@ class LookupModule(DiscoverableModule):
         )
         if not chunk_hashes:
             self._register_empty_prefetch_job(
-                key, early_exit_reason="empty_chunk_hashes"
+                key, session, generation, early_exit_reason="empty_chunk_hashes"
             )
             return
 
@@ -268,19 +285,10 @@ class LookupModule(DiscoverableModule):
                 )
             )
 
-        # Submit one key row per (object group, kv rank), each with its own
-        # attention window.
-        attn_desc = self._ctx.layout_desc_registry.find_attn_desc(
-            model_name, world_size
-        )
-        session = self._ctx.session_manager.get_or_create(key.request_id)
-        session.set_tokens(key.token_bytes)
-
         start_chunk = min(max(0, key.start // self._ctx.chunk_size), len(chunk_hashes))
         # The engine-covered prefix is never looked up, so it is excluded from
         # the hit-rate denominator and reported separately.
         looked_up_tokens = requested_tokens - start_chunk * self._ctx.chunk_size
-        session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
 
         group_layout_descs = self._ctx.layout_desc_registry.find_group_layout_descs(
             model_name, world_size
@@ -293,7 +301,7 @@ class LookupModule(DiscoverableModule):
                 world_size,
             )
             self._register_empty_prefetch_job(
-                key, early_exit_reason="no_group_layout_descs"
+                key, session, generation, early_exit_reason="no_group_layout_descs"
             )
             return
 
@@ -312,6 +320,8 @@ class LookupModule(DiscoverableModule):
             # declined tokens as unserved.
             self._register_empty_prefetch_job(
                 key,
+                session,
+                generation,
                 requested_tokens=looked_up_tokens,
                 num_object_groups=attn_desc.num_object_groups,
                 attn_desc=attn_desc,
@@ -342,6 +352,8 @@ class LookupModule(DiscoverableModule):
             # empty job still reports the covered prefix as the hit.
             self._register_empty_prefetch_job(
                 key,
+                session,
+                generation,
                 requested_tokens=looked_up_tokens,
                 num_object_groups=attn_desc.num_object_groups,
                 attn_desc=attn_desc,
@@ -370,6 +382,8 @@ class LookupModule(DiscoverableModule):
                 row_windows=tuple(row.sliding_window_size for row in spec.key_groups),
                 request_id=key.request_id,
                 requested_tokens=looked_up_tokens,
+                session=session,
+                lookup_generation=generation,
                 num_object_groups=attn_desc.num_object_groups,
                 attn_desc=attn_desc,
                 start_chunk=start_chunk,
@@ -448,7 +462,7 @@ class LookupModule(DiscoverableModule):
 
         if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
             return None
-        return self.query_prefetch_status(request_id)
+        return self._consume_prefetch_result(job)
 
     @request_handler(HandlerType.BLOCKING)
     def free_lookup_locks(
@@ -588,6 +602,9 @@ class LookupModule(DiscoverableModule):
             )
             return
 
+        if not session.prefetch_group_windows:
+            return
+
         chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
         obj_keys = self._all_object_keys(session.lookup_ipc_key, chunk_hashes)
         # unified touch of all keys, which include retrieved and stored keys
@@ -626,11 +643,16 @@ class LookupModule(DiscoverableModule):
 
     def _register_prefetch_job(self, job: _PrefetchJob) -> None:
         with self._prefetch_job_lock:
-            self._prefetch_jobs[job.request_id] = job
+            if self._ctx.session_manager.get(job.request_id) is not job.session:
+                return
+            if job.session.is_lookup_current(job.lookup_generation):
+                self._prefetch_jobs[job.request_id] = job
 
     def _register_empty_prefetch_job(
         self,
         key: IPCCacheServerKey,
+        session: Session,
+        lookup_generation: int,
         requested_tokens: int = 0,
         num_object_groups: int = 1,
         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
@@ -642,6 +664,8 @@ class LookupModule(DiscoverableModule):
 
         Args:
             key: The lookup's cache key.
+            session: The session that started the lookup.
+            lookup_generation: The generation returned by begin_lookup.
             requested_tokens: Hit-rate denominator tokens; 0 on early exits.
             num_object_groups: Object groups of the request's layout.
             attn_desc: The request's attention window descriptor.
@@ -664,6 +688,8 @@ class LookupModule(DiscoverableModule):
                 row_windows=(),
                 request_id=key.request_id,
                 requested_tokens=requested_tokens,
+                session=session,
+                lookup_generation=lookup_generation,
                 num_object_groups=num_object_groups,
                 attn_desc=attn_desc,
                 start_chunk=start_chunk,
@@ -692,7 +718,8 @@ class LookupModule(DiscoverableModule):
 
         Returns:
             The hit chunk count, or None while the prefetch is still running
-            (the job is kept so a later call can resolve it).
+            (the job is kept so a later call can resolve it). Returns zero
+            when the job or its session's lookup generation was replaced.
         """
         result = self._ctx.storage_manager.query_prefetch_status(job.handle)
         if result is None:
@@ -720,12 +747,26 @@ class LookupModule(DiscoverableModule):
         # free_lookup_locks can reconstruct which keys the prefetch
         # read-locked (see ``unfold``: full-attention groups lock the whole
         # hit prefix, sliding-window groups only its in-window suffix).
-        session = self._ctx.session_manager.get_or_create(job.request_id)
-        session.record_prefetch_result(
-            found_count,
-            tuple(range(job.attn_desc.num_object_groups)),
-            result.l1_owners,
-        )
+        with self._prefetch_job_lock:
+            if self._prefetch_jobs.get(job.request_id) is not job:
+                return 0
+            del self._prefetch_jobs[job.request_id]
+            if self._ctx.session_manager.get(job.request_id) is not job.session:
+                return 0
+            if not job.session.record_prefetch_result(
+                found_count,
+                tuple(range(job.attn_desc.num_object_groups)),
+                result.l1_owners,
+                observation=LookupObservation(
+                    hit_chunks=found_count,
+                    l1_resident_keys=tuple(
+                        row.popcount() for row in result.l1_hit_cells
+                    ),
+                    l2_loaded_keys=tuple(row.popcount() for row in result.l2_hit_cells),
+                ),
+                lookup_generation=job.lookup_generation,
+            ):
+                return 0
 
         chunk_size = self._ctx.chunk_size
         covered_tokens = job.engine_covered_chunks * chunk_size
@@ -759,9 +800,6 @@ class LookupModule(DiscoverableModule):
                 },
             )
         )
-
-        with self._prefetch_job_lock:
-            self._prefetch_jobs.pop(job.request_id, None)
 
         return found_count
 

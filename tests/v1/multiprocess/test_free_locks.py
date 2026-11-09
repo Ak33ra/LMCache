@@ -5,7 +5,7 @@ server handler, and client-side adapter API.
 """
 
 # Standard
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 # Third Party
 import pytest
@@ -135,6 +135,7 @@ def _make_free_locks_ctx(
         num_chunks_in_sw=windows
     )
     session = ctx.session_manager.get_or_create.return_value
+    ctx.session_manager.get.return_value = session
     session.prefetch_hit_chunks = hit_chunks
     session.prefetch_locked_gids = tuple(locked_gids)
     session.lookup_ipc_key = _free_locks_key(1024, start=lookup_start, end=1024)
@@ -319,7 +320,7 @@ def test_server_free_lookup_locks_consumes_pending_result_first():
     """An unconsumed result supplies the exact hit length and retained owners."""
     ctx = _make_free_locks_ctx([b"h0", b"h1", b"h2"], windows=[-1], hit_chunks=-1)
     session = ctx.session_manager.get_or_create.return_value
-    session.record_prefetch_result.side_effect = lambda hit, gids, owners=None: (
+    session.record_prefetch_result.side_effect = lambda hit, gids, owners=None, **kw: (
         setattr(session, "prefetch_hit_chunks", hit),
         setattr(session, "prefetch_locked_gids", gids),
     )
@@ -342,11 +343,15 @@ def test_server_free_lookup_locks_consumes_pending_result_first():
         row_windows=(-1,),
         request_id="req-sw",
         requested_tokens=768,
+        session=session,
+        lookup_generation=1,
     )
 
     module.free_lookup_locks(_free_locks_key(1024, start=0, end=768), 1)
 
-    session.record_prefetch_result.assert_called_once_with(2, (0,), owners)
+    session.record_prefetch_result.assert_called_once_with(
+        2, (0,), owners, observation=ANY, lookup_generation=1
+    )
     assert "req-sw" not in module._prefetch_jobs
     ctx.event_bus.publish.assert_called_once()
     assert (
@@ -377,6 +382,8 @@ def test_server_free_lookup_locks_while_prefetch_running_releases_nothing():
         row_windows=(-1,),
         request_id="req-sw",
         requested_tokens=768,
+        session=ctx.session_manager.get.return_value,
+        lookup_generation=1,
     )
 
     module.free_lookup_locks(_free_locks_key(1024, start=0, end=768), 1)

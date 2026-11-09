@@ -3,7 +3,7 @@
 
 The prefetch-controller tests cover the condition-variable wait in isolation;
 these cover the ``LookupModule`` handler that ``WAIT_PREFETCH_STATUS`` dispatches
-to, i.e. the ``wait_prefetch_status -> query_prefetch_status`` path: count
+to: count
 computation, event emission, and exactly-once job consumption. The storage
 manager is mocked, so no GPU or native bitmap is needed.
 """
@@ -69,6 +69,8 @@ def test_wait_prefetch_status_returns_count_and_consumes_job():
         row_windows=(-1,) * world_size,
         request_id="req",
         requested_tokens=512,
+        session=ctx.session_manager.get.return_value,
+        lookup_generation=1,
     )
 
     assert module.wait_prefetch_status("req", timeout=1.0) == 4
@@ -78,9 +80,15 @@ def test_wait_prefetch_status_returns_count_and_consumes_job():
     assert "req" not in module._prefetch_jobs
     # The hit length is recorded on the session so free_lookup_locks can
     # later reconstruct which keys the prefetch read-locked.
-    ctx.session_manager.get_or_create.assert_called_once_with("req")
-    session = ctx.session_manager.get_or_create.return_value
-    session.record_prefetch_result.assert_called_once_with(4, (0,), {})
+    ctx.session_manager.get_or_create.assert_not_called()
+    session = ctx.session_manager.get.return_value
+    session.record_prefetch_result.assert_called_once_with(
+        4, (0,), {}, observation=mock.ANY, lookup_generation=1
+    )
+    observation = session.record_prefetch_result.call_args.kwargs["observation"]
+    assert observation.hit_chunks == 4
+    assert observation.l1_resident_keys == (4, 4)
+    assert observation.l2_loaded_keys == (0, 0)
 
 
 def test_wait_prefetch_status_timeout_returns_none_and_keeps_job():
@@ -91,6 +99,8 @@ def test_wait_prefetch_status_timeout_returns_none_and_keeps_job():
         row_windows=(-1,),
         request_id="req",
         requested_tokens=0,
+        session=ctx.session_manager.get.return_value,
+        lookup_generation=1,
     )
     module._prefetch_jobs["req"] = job
 

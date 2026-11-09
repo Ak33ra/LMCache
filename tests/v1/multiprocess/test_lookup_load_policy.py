@@ -50,6 +50,9 @@ class _ConfiguredPolicy(KVLoadPolicy):
 
 def _ctx() -> MagicMock:
     ctx = MagicMock()
+    ctx.session_manager.get.return_value = (
+        ctx.session_manager.get_or_create.return_value
+    )
     ctx.chunk_size = CHUNK_SIZE
     ctx.event_bus.has_subscribers.return_value = False
     ctx.layout_desc_registry.find_attn_desc.return_value = AttnWindowDesc(

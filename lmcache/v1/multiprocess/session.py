@@ -28,6 +28,19 @@ from lmcache.v1.periodic_thread import (
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class LookupObservation:
+    """Consumed lookup result, with interface-origin counts per key-grid row.
+
+    L1 counts include temporary reuse. L2 counts do not imply remote locality.
+    A subsequent retrieve can still fail after the lookup completed.
+    """
+
+    hit_chunks: int
+    l1_resident_keys: tuple[int, ...]
+    l2_loaded_keys: tuple[int, ...]
+
+
 @dataclass
 class Session:
     """Tracks accumulated token IDs and computed chunk hashes for a request.
@@ -54,6 +67,7 @@ class Session:
     _prefetch_owners: dict[ObjectKey, int] = field(default_factory=dict, repr=False)
     extras: dict[str, Any] = field(default_factory=dict)
     _lookup_generation: int = field(default=0, repr=False)
+    _lookup_observation: LookupObservation | None = field(default=None, repr=False)
     _failed_retrieve_releases: set[tuple[int, int, int, int, int]] = field(
         default_factory=set, repr=False
     )
@@ -155,8 +169,8 @@ class Session:
         self,
         key: IPCCacheServerKey,
         group_windows: tuple[int, ...],
-    ) -> None:
-        """Record a new lookup and reset its per-lookup release state."""
+    ) -> int:
+        """Reset per-lookup state and return the new lookup generation."""
         with self._lock:
             self.lookup_ipc_key = key
             self.prefetch_hit_chunks = -1
@@ -165,18 +179,43 @@ class Session:
             self._lookup_generation += 1
             self._failed_retrieve_releases.clear()
             self._prefetch_owners.clear()
+            self._lookup_observation = None
+            return self._lookup_generation
+
+    def is_lookup_current(self, generation: int) -> bool:
+        """Whether this generation still owns the session's lookup state."""
+        with self._lock:
+            return self._lookup_generation == generation
 
     def record_prefetch_result(
         self,
         hit_chunks: int,
         locked_gids: tuple[int, ...],
         l1_owners: dict[ObjectKey, int] | None = None,
-    ) -> None:
-        """Record the lock set acquired by the current lookup."""
+        observation: LookupObservation | None = None,
+        *,
+        lookup_generation: int | None = None,
+    ) -> bool:
+        """Record a result unless its supplied lookup generation was replaced."""
         with self._lock:
+            if (
+                lookup_generation is not None
+                and lookup_generation != self._lookup_generation
+            ):
+                return False
             self.prefetch_hit_chunks = hit_chunks
             self.prefetch_locked_gids = locked_gids
             self._prefetch_owners = dict(l1_owners) if l1_owners is not None else {}
+            self._lookup_observation = observation
+            return True
+
+    def get_lookup_observation(self) -> LookupObservation | None:
+        """Return the consumed lookup receipt, or None before consumption.
+
+        Reading this snapshot does not extend the session or any read lock.
+        """
+        with self._lock:
+            return self._lookup_observation
 
     def get_prefetch_owners(self) -> dict[ObjectKey, int]:
         """Snapshot the L1 owners whose read locks this session's lookup retained."""
