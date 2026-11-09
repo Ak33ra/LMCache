@@ -7,11 +7,21 @@ MP server. The default connector behavior remains unchanged.
 
 ## Supported boundary
 
-Construction requires the fork's `MOONCAKE_FENCED_TCP_OWNERSHIP_API=1` header and
-runtime ownership snapshot version 1. The complete fork contract includes local
+Construction requires the fork's `MOONCAKE_FENCED_TCP_OWNERSHIP_API=1` and
+`MOONCAKE_STORE_GENERATION_BINDING_API=1` headers and runtime ownership snapshot
+version 1. Python startup checks the connector's exported
+`store_generation_binding_api_version` before constructing a partition client.
+The complete fork contract includes local
 TCP registration generations, terminal Store futures, retryable teardown,
 local-only registrations, and mmap-owned removable shared segments. A stock
 SDK build still supports the default connector, but rejects partition mode.
+
+Store allocation and lookup descriptors retain the exact registration generation
+captured at mount. Every single, batch and scatter transfer carries that binding.
+Refreshing endpoint metadata can discover a newly mounted range, but cannot
+rebind a retained descriptor to a new allocation at the same address. Missing
+or changed generations fail in strict Store mode. Raw offload pointers and
+hot-cache redirects do not provide this binding and remain unsupported.
 
 Required setup is `protocol="tcp"`, `global_segment_size="0"`,
 `MC_TCP_REQUIRE_GENERATION=1`, and `MC_NOF_BACKEND=none`. Permanent
@@ -110,7 +120,7 @@ unchanged:
 ```bash
 MAX_JOBS=2 CUDA_VISIBLE_DEVICES='' /scratch/akira/lmcache-dev/bin/python \
   csrc/storage_backends/mooncake/build_partition_connector.py \
-  --sdk-root /scratch/akira/kvc-worktrees/mooncake-fenced
+  --sdk-root /scratch/akira/kvc-worktrees/mooncake-store-generation-20261109
 export CUDA_VISIBLE_DEVICES=''
 export LMCACHE_TRACK_USAGE=false
 export MC_TCP_REQUIRE_GENERATION=1
@@ -118,7 +128,7 @@ export MC_NOF_BACKEND=none
 export PYTHONPATH="$PWD"
 /scratch/akira/lmcache-dev/bin/python \
   csrc/storage_backends/mooncake/verify_partition_controls.py \
-  --master-bin /scratch/akira/kvc-worktrees/mooncake-fenced/build/mooncake-store/src/mooncake_master \
+  --master-bin /scratch/akira/kvc-worktrees/mooncake-store-generation-20261109/build/mooncake-store/src/mooncake_master \
   --output /tmp/kvc-native-partition-manual
 ```
 

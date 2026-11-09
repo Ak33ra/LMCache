@@ -17,6 +17,12 @@ PYBIND11_MODULE(lmcache_mooncake, m) {
 #else
   m.attr("partition_control_api_version") = 0;
 #endif
+#ifdef MOONCAKE_STORE_GENERATION_BINDING_API
+  m.attr("store_generation_binding_api_version") =
+      MOONCAKE_STORE_GENERATION_BINDING_API;
+#else
+  m.attr("store_generation_binding_api_version") = 0;
+#endif
   py::enum_<PartitionControlCode>(m, "PartitionControlCode")
       .value("SUCCESS", PartitionControlCode::SUCCESS)
       .value("BUSY", PartitionControlCode::BUSY)

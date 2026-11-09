@@ -56,7 +56,10 @@ def build(sdk: Path, output_dir: Path | None = None) -> None:
     if destination.is_symlink():
         raise RuntimeError("Refusing to overwrite a Mooncake extension symlink")
     shutil.copy2(module.__file__, destination)
-    print(f"Built {destination}; partition API {module.partition_control_api_version}")
+    print(
+        f"Built {destination}; partition API {module.partition_control_api_version}, "
+        f"Store generation API {module.store_generation_binding_api_version}"
+    )
 
 
 if __name__ == "__main__":

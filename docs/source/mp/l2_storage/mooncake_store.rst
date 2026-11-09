@@ -114,9 +114,11 @@ Experimental CPU partition controls
 -----------------------------------
 
 The native connector accepts ``partition_controls=True`` only with the fenced
-CPU TCP SDK fork. This mode requires zero setup shared capacity and dynamic
-local-buffer registration. It exposes explicit local registration, removable
-shared segment allocation/release, accounting snapshots, and retryable close.
+CPU TCP SDK fork and Store generation binding API 1. Rebuild older connectors
+against the matching fork: endpoint metadata refresh alone cannot protect a retained Store lookup
+after memory is reused. This mode requires zero setup shared capacity and
+dynamic local-buffer registration. It exposes explicit local registration,
+removable shared segment allocation/release, accounting snapshots, and retryable close.
 It does not enable partitioning in the MP server by itself.
 
 Control calls return typed results. ``BUSY`` retains all ownership for retry.

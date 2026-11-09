@@ -355,6 +355,40 @@ class TestMooncakeStoreRegistration:
         with pytest.raises(RuntimeError, match="Mooncake"):
             create_l2_adapter_from_registry(config)
 
+    @pytest.mark.parametrize("api_version", [None, 0], ids=["absent", "zero"])
+    def test_partition_factory_rejects_missing_generation_binding(
+        self, monkeypatch: pytest.MonkeyPatch, api_version: int | None
+    ) -> None:
+        """Reject old connectors before constructing a native client."""
+
+        class UnexpectedClient:
+            def __init__(self, **kwargs: object) -> None:
+                pytest.fail("Unsupported connector reached native construction")
+
+        _install_fake_mooncake_extension(monkeypatch, UnexpectedClient)
+        extension = sys.modules["lmcache.lmcache_mooncake"]
+        monkeypatch.setattr(
+            sys.modules["lmcache"], "lmcache_mooncake", extension, raising=False
+        )
+        if api_version is not None:
+            monkeypatch.setattr(
+                extension,
+                "store_generation_binding_api_version",
+                api_version,
+                raising=False,
+            )
+        scratch_bytes = 16 * 1024 * 1024
+        config = MooncakeStoreL2AdapterConfig.from_dict(
+            {
+                "protocol": "tcp",
+                "global_segment_size": "0",
+                "local_buffer_size": str(scratch_bytes),
+            }
+        ).for_partition(scratch_bytes)
+
+        with pytest.raises(RuntimeError, match="registration-generation binding API 1"):
+            create_l2_adapter_from_registry(config)
+
 
 def _install_fake_mooncake_extension(
     monkeypatch: pytest.MonkeyPatch,

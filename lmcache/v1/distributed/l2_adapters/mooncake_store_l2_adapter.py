@@ -214,6 +214,15 @@ def _create_mooncake_store_l2_adapter(
 
     if not isinstance(config, MooncakeStoreL2AdapterConfig):
         raise ValueError(f"Expected MooncakeStoreL2AdapterConfig, got {type(config)}")
+    if config.partition_controls:
+        # First Party
+        from lmcache import lmcache_mooncake
+
+        if getattr(lmcache_mooncake, "store_generation_binding_api_version", 0) < 1:
+            raise RuntimeError(
+                "Partition mode requires a Mooncake connector rebuilt with "
+                "Store registration-generation binding API 1"
+            )
     l1_registration = L1RegistrationConfig()
     if config.setup_config.get("protocol") == "rdma":
         if l1_memory_desc is None:

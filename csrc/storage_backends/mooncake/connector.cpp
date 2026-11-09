@@ -507,6 +507,11 @@ void MooncakeConnector::validate_partition_config() const {
 #ifndef MOONCAKE_FENCED_TCP_OWNERSHIP_API
   throw std::runtime_error("Partition controls require the fenced CPU TCP SDK");
 #else
+#if !defined(MOONCAKE_STORE_GENERATION_BINDING_API) || \
+    MOONCAKE_STORE_GENERATION_BINDING_API < 1
+  throw std::runtime_error(
+      "Partition mode requires Store registration-generation binding API 1");
+#endif
   auto configured = [&](const char* key, const char* value) {
     auto found = config_.find(key);
     return found != config_.end() && found->second == value;
