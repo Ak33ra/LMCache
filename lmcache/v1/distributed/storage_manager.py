@@ -13,7 +13,7 @@ import threading
 import time
 
 # First Party
-from lmcache.lmcache_native import PeriodicEventNotifier
+from lmcache.lmcache_native import Bitmap, PeriodicEventNotifier
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import (
     CapacitySnapshot,
@@ -966,14 +966,23 @@ class StorageManager:
 
         Returns:
             The task's result once it has finished, None while it is still
-            in progress.
+            in progress. A task declined by partition admission completes
+            with zero-hit bitmaps matching the requested key-group layout
+            and owns no read locks.
 
         Note:
-            Each result is returned once; later calls for the same handle
-            return None.
+            Admitted controller results are returned once; later calls for
+            the same handle return None. Already-complete miss handles do
+            not retain controller state.
         """
         if handle.prefetch_request_id == -1:
-            return PrefetchResult(hit_cells=[], l1_hit_cells=[], l2_hit_cells=[])
+            rows = len(handle.sliding_windows)
+            group_size = handle.total_requested_keys // rows if rows else 0
+            return PrefetchResult(
+                hit_cells=[Bitmap(group_size) for _ in range(rows)],
+                l1_hit_cells=[Bitmap(group_size) for _ in range(rows)],
+                l2_hit_cells=[Bitmap(group_size) for _ in range(rows)],
+            )
         result = self._prefetch_controller.query_prefetch_result(
             handle.prefetch_request_id
         )

@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Event
 from types import SimpleNamespace
+from typing import Iterator
 from unittest.mock import MagicMock
 
 # Third Party
@@ -16,6 +17,13 @@ import pytest
 # First Party
 from lmcache.lmcache_native import Bitmap
 from lmcache.v1.distributed.api import AttnWindowDesc, PrefetchHandle, PrefetchResult
+from lmcache.v1.distributed.config import (
+    EvictionConfig,
+    L1ManagerConfig,
+    L1MemoryManagerConfig,
+    StorageManagerConfig,
+)
+from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.http_apis.lookup_api import router
 from lmcache.v1.multiprocess.modules.lookup import LookupModule
@@ -220,3 +228,98 @@ def test_completion_during_replacement_submission(lookup_case, reuse_session_id)
     assert module.query_prefetch_status("r") == 2
     assert client.get("/cache/lookups/r").json()["hit_chunks"] == 2
     ctx.storage_manager.finish_read_prefetched.assert_not_called()
+
+
+@pytest.fixture
+def storage() -> Iterator[StorageManager]:
+    """Use real status handling and CPU allocation without a native Store."""
+    manager = StorageManager(
+        StorageManagerConfig(
+            l1_manager_config=L1ManagerConfig(
+                L1MemoryManagerConfig(size_in_bytes=16384, use_lazy=False, shm_name="")
+            ),
+            eviction_config=EvictionConfig(eviction_policy="noop"),
+        )
+    )
+    try:
+        yield manager
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("poll", ["query", "wait"])
+@pytest.mark.parametrize("start_chunk", [0, 1])
+@pytest.mark.parametrize("windows", [(-1,), (-1, 1)])
+def test_quiesced_lookup_records_miss_without_locks(
+    lookup_case: tuple[MagicMock, IPCCacheServerKey, LookupModule, TestClient],
+    storage: StorageManager,
+    poll: str,
+    start_chunk: int,
+    windows: tuple[int, ...],
+) -> None:
+    """A declined prefetch preserves row receipts and engine-covered offsets."""
+    ctx, key, module, client = lookup_case
+    key = replace(key, start=start_chunk * ctx.chunk_size, world_size=2)
+    ctx.layout_desc_registry.find_attn_desc.return_value = AttnWindowDesc(
+        num_chunks_in_sw=list(windows), world_size=2
+    )
+    ctx.layout_desc_registry.find_group_layout_descs.return_value = {
+        group: MagicMock() for group in range(len(windows))
+    }
+    rows = len(windows) * key.world_size
+    ctx.storage_manager.submit_prefetch_task.side_effect = None
+    ctx.storage_manager.submit_prefetch_task.return_value = PrefetchHandle(
+        -1,
+        "r",
+        (2 - start_chunk) * rows,
+        0.0,
+        sliding_windows=tuple(w for w in windows for _ in range(key.world_size)),
+    )
+    ctx.storage_manager.query_prefetch_status.side_effect = (
+        storage.query_prefetch_status
+    )
+    ctx.storage_manager.wait_prefetch_status.side_effect = storage.wait_prefetch_status
+
+    module.lookup(key, 1)
+    assert client.get("/cache/lookups/r").status_code == 409
+    count = (
+        module.query_prefetch_status("r")
+        if poll == "query"
+        else module.wait_prefetch_status("r", 0)
+    )
+    assert count == start_chunk
+    assert client.get("/cache/lookups/r").json() == {
+        "request_id": "r",
+        "hit_chunks": start_chunk,
+        "l1_resident_keys": [0] * rows,
+        "l2_loaded_keys": [0] * rows,
+    }
+    assert module.report_status()["active_prefetch_jobs"] == 0
+    assert module.query_prefetch_status("r") == 0
+    module.end_session("r")
+    assert client.get("/cache/lookups/r").status_code == 404
+    ctx.storage_manager.finish_read_prefetched.assert_not_called()
+    assert storage.report_status()["l1_manager"]["read_locked_count"] == 0
+
+
+def test_submitted_malformed_prefetch_result_still_fails(
+    lookup_case: tuple[MagicMock, IPCCacheServerKey, LookupModule, TestClient],
+) -> None:
+    """An invalid admitted result must not be hidden as a quiesce miss."""
+    ctx, key, module, client = lookup_case
+    module.lookup(key, 1)
+    ctx.storage_manager.query_prefetch_status.side_effect = None
+    ctx.storage_manager.query_prefetch_status.return_value = PrefetchResult([], [], [])
+    with pytest.raises(ValueError, match="rows and windows"):
+        module.query_prefetch_status("r")
+    assert client.get("/cache/lookups/r").status_code == 409
+
+
+def test_early_exit_handle_keeps_empty_result(storage: StorageManager) -> None:
+    """Lookups with no requested rows need no bitmap or lock ownership."""
+    handle = PrefetchHandle(-1, "empty", 0, 0.0)
+    assert storage.wait_prefetch_status(handle, 0)
+    result = storage.query_prefetch_status(handle)
+    assert result is not None
+    assert result.hit_cells == result.l1_hit_cells == result.l2_hit_cells == []
+    assert result.l1_owners == {}
