@@ -20,6 +20,11 @@ it prevents rounding a shared allocation beyond the remaining budget. Alpha
 zero and one produce exact shared-only and private-only retained targets.
 At intermediate alphas, at least one shared segment remains. Integer-ratio
 arithmetic preserves the endpoint even for byte budgets beyond float precision.
+The ratio uses alpha's shortest decimal representation, so a configured 0.3
+means exactly 3/10. This prevents the binary float approximation from dropping
+an entire segment at an exact boundary: 0.3 of 160 MiB requests and retains
+48 MiB private, with 112 MiB shared. Values genuinely below that boundary still
+round down; no tolerance or upward rounding is applied.
 
 An 88 MiB budget with 16 MiB temporary reserve and 8 MiB SDK reserve leaves
 64 MiB retained capacity. With the measured 16 MiB SDK granule, alpha 0.3

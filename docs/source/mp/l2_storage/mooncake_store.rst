@@ -153,6 +153,9 @@ The MP server accepts ``--kv-partition`` with four explicit fields:
 This reserves 16 MiB for temporary L1 operations and 8 MiB for SDK scratch.
 The remaining 64 MiB is split into private and shared backing in whole native
 segments. With the tested 16 MiB granule, alpha 0.5 gives 32 MiB to each.
+Alpha uses its decimal representation: with 160 MiB retained, alpha 0.3
+gives 48 MiB private and 112 MiB shared. Targets between segment boundaries
+round private capacity down and give the remainder to shared capacity.
 The total bounds managed cache backing. RPC buffers, worker tensors, runtime
 metadata, and process RSS are separate.
 

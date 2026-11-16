@@ -3,6 +3,7 @@
 
 # Standard
 from dataclasses import dataclass
+from decimal import Decimal
 import math
 import mmap
 import sys
@@ -87,6 +88,7 @@ class PartitionConfig:
             granularity_bytes: Native-reported segment granule; a page-aligned
                 power of two. Private and shared use the same granule.
             alpha: Optional resize target. Omission uses the configured alpha.
+                Its shortest decimal representation defines the requested ratio.
 
         Returns:
             Requested and effective byte targets, including unused slack.
@@ -107,7 +109,7 @@ class PartitionConfig:
         retained = available // granularity_bytes * granularity_bytes
         if not retained:
             raise ValueError("Retained budget must fit at least one native segment")
-        numerator, denominator = fraction.as_integer_ratio()
+        numerator, denominator = Decimal(str(fraction)).as_integer_ratio()
         private_requested = retained * numerator // denominator
         private = private_requested // granularity_bytes * granularity_bytes
         return PartitionCapacity(

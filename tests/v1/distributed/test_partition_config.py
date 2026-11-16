@@ -3,6 +3,7 @@
 
 # Standard
 from dataclasses import replace
+import math
 import sys
 
 # Third Party
@@ -57,6 +58,39 @@ def test_large_integer_budget_preserves_exact_endpoint() -> None:
     assert capacity.private_requested_bytes == capacity.retained_bytes
     assert capacity.private_effective_bytes == capacity.retained_bytes
     assert capacity.shared_effective_bytes == 0
+
+
+@pytest.mark.parametrize("index", range(11))
+@pytest.mark.parametrize(
+    "pool_bytes", [160 * MIB, (sys.maxsize - 24 * MIB) // GRANULE * GRANULE]
+)
+def test_decimal_alpha_grid_at_startup_and_resize(index: int, pool_bytes: int) -> None:
+    """Decimal tenths preserve their requested bytes, including exact granules."""
+    alpha = index / 10
+    config = replace(CONFIG, total_bytes=pool_bytes + 24 * MIB, alpha=alpha)
+    startup = config.capacity(GRANULE)
+    resized = replace(config, alpha=0.5).capacity(GRANULE, alpha=alpha)
+    assert startup == resized
+    assert startup.private_requested_bytes == pool_bytes * index // 10
+    assert startup.shared_requested_bytes == pool_bytes - pool_bytes * index // 10
+    assert startup.private_effective_bytes == (
+        pool_bytes * index // 10 // GRANULE * GRANULE
+    )
+    assert startup.private_effective_bytes + startup.shared_effective_bytes == (
+        pool_bytes
+    )
+
+
+@pytest.mark.parametrize(
+    "alpha,private_mib",
+    [(math.nextafter(0.3, 0), 32), (0.3, 48), (math.nextafter(0.3, 1), 48)],
+)
+def test_decimal_boundary_does_not_round_up_nearby_requests(
+    alpha: float, private_mib: int
+) -> None:
+    """A value genuinely below a segment boundary still receives fewer segments."""
+    config = replace(CONFIG, total_bytes=184 * MIB, alpha=alpha)
+    assert config.capacity(GRANULE).private_effective_bytes == private_mib * MIB
 
 
 @pytest.mark.parametrize("alpha", [True, -0.1, 1.1, float("nan"), float("inf"), "0.5"])
