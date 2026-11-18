@@ -892,21 +892,26 @@ class MessageQueueServer(RequestServer):
         future.add_done_callback(complete)
 
     def _send_responses(self) -> None:
+        attempts = self.output_queue.qsize()
         try:
-            while frames_to_send := self.output_queue.get_nowait():
+            while self._limits is None or attempts > 0:
+                frames_to_send = self.output_queue.get_nowait()
+                attempts -= 1
                 key = (frames_to_send[0], frames_to_send[1])
                 try:
                     self.socket.send_multipart(
                         frames_to_send, flags=zmq.NOBLOCK if self._limits else 0
                     )
-                except zmq.ZMQError:
+                except zmq.ZMQError as error:
+                    if self._limits is not None and error.errno == zmq.EAGAIN:
+                        self.output_queue.put_nowait(frames_to_send)
+                        continue
                     if key in self.streams:
                         self.streams[key][0].close()
                     else:
                         logger.warning("Response destination disconnected")
-                finally:
-                    if self._limits is not None:
-                        self._credits.release()
+                if self._limits is not None:
+                    self._credits.release()
                 if len(frames_to_send) == 3:
                     self.streams.pop(key, None)
         except queue.Empty:
@@ -915,7 +920,8 @@ class MessageQueueServer(RequestServer):
     def _main_loop(self):
         output_fd = self._output_efd.fileno()
         while not self.is_finished.is_set():
-            socks = dict(self.poller.poll(1000))
+            timeout_ms = 10 if self._limits and not self.output_queue.empty() else 1000
+            socks = dict(self.poller.poll(timeout_ms))
             inbound_state = socks.get(self.socket, None)
             outbound_state = socks.get(output_fd, None)
 
