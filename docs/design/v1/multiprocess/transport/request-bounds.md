@@ -7,7 +7,11 @@ These auxiliary limits are separate from managed cache backing and SDK scratch.
 
 One semaphore credit covers a decoded request waiting in an executor, a running
 handler, and its serialized response waiting in the Python output queue. The
-socket loop releases the credit only after nonblocking send or drop. Handler
+socket loop releases the credit only after successful nonblocking send or
+permanent destination failure. Transient send backpressure retains the response
+and its credit. Each pass attempts at most the initial queue length, rotating
+blocked replies so other destinations can progress. Pending responses shorten
+the poll timeout to 10 ms so retries do not require a new completion. Handler
 failure and pre-submit decoding failure return refusal and release their credit.
 The response queue has the same finite capacity as the semaphore. A completed
 handler cannot fill it beyond that capacity because it still owns its credit.
@@ -18,8 +22,9 @@ than the limit are replaced by refusal. Unary requests only are supported in
 bounded mode. Stream subscriptions and stream control frames are refused.
 Refusal uses the reserved `__request_refused__` response operation, which existing
 clients report as an operation mismatch. Refusals are sent directly with
-`NOBLOCK`, never appended to another queue. Backpressure/disconnection can drop
-a response or refusal; callers need finite timeouts. A timeout does not cancel
+`NOBLOCK`, never appended to another queue. Backpressure can drop a refusal;
+disconnection can drop a response or refusal. Callers need finite timeouts.
+A timeout does not cancel
 a running handler or free its credit early.
 
 The single socket loop still owns sends and receives. Handler callbacks only
@@ -52,4 +57,7 @@ it is not protection against malicious multipart or connection floods.
 DEALER sockets with 1 KiB wire limits. It verifies accepted running/queued work,
 aggregate oversized requests, malformed arguments, handler failures, oversized
 responses, reuse after refusal, and shutdown while a handler is blocked.
+Injected send backpressure verifies reply retry, retained admission credits,
+progress for another peer, and shutdown with an unsent response. Concurrent
+callers also exchange 10,000 replies over TCP without fault injection.
 `USER_VERIFY.md` records the exact command and dated evidence.

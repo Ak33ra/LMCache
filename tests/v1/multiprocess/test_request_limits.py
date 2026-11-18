@@ -3,6 +3,7 @@
 
 # Standard
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Callable
 import threading
@@ -18,7 +19,10 @@ from lmcache.v1.multiprocess.futures import MessagingStream
 from lmcache.v1.multiprocess.request_handler import HandlerType
 from lmcache.v1.multiprocess.rpc import get_rpc_spec
 from lmcache.v1.multiprocess.transport.request_limits import RequestLimits
-from lmcache.v1.multiprocess.transport.zmq_impl.mq import MessageQueueServer
+from lmcache.v1.multiprocess.transport.zmq_impl.mq import (
+    MessageQueueClient,
+    MessageQueueServer,
+)
 from lmcache.v1.multiprocess.transport.zmq_impl.wire import (
     decode_operation,
     encode_operation,
@@ -222,3 +226,150 @@ def test_disconnected_destination_does_not_block_next_client() -> None:
                 pytest.fail("Disconnected requests did not release capacity")
         finally:
             next_peer.close(linger=0)
+
+
+def test_transient_response_pressure_retries_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single EAGAIN must not lose an already accepted RPC reply."""
+    failed = threading.Event()
+    original_send = zmq.Socket.send_multipart
+
+    def handler() -> str:
+        return "ok"
+
+    with running_server(handler) as (server, peer):
+
+        def send_once_blocked(
+            socket: zmq.Socket, frames: list[bytes], flags: int = 0
+        ) -> None:
+            if socket is server.socket and not failed.is_set():
+                failed.set()
+                raise zmq.Again()
+            original_send(socket, frames, flags=flags)
+
+        monkeypatch.setattr(zmq.Socket, "send_multipart", send_once_blocked)
+        send(peer, 1)
+        assert failed.wait(3)
+        assert receive(peer) == (1, "noop", [msgspec.msgpack.encode("ok")])
+        send(peer, 2)
+        assert receive(peer)[:2] == (2, "noop")
+
+
+def test_unsent_response_retains_admission_credit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsent reply and a running handler exhaust the two-request limit."""
+    failed = threading.Event()
+    writable = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    original_send = zmq.Socket.send_multipart
+
+    def handler() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            entered.set()
+            assert release.wait(10)
+        return "ok"
+
+    with running_server(handler, blocking=True) as (server, peer):
+
+        def send_when_writable(
+            socket: zmq.Socket, frames: list[bytes], flags: int = 0
+        ) -> None:
+            if (
+                socket is server.socket
+                and msgspec.msgpack.decode(frames[1]) == 1
+                and not writable.is_set()
+            ):
+                failed.set()
+                raise zmq.Again()
+            original_send(socket, frames, flags=flags)
+
+        monkeypatch.setattr(zmq.Socket, "send_multipart", send_when_writable)
+        try:
+            send(peer, 1)
+            assert failed.wait(3)
+            send(peer, 2)
+            assert entered.wait(3)
+            send(peer, 3)
+            assert receive(peer)[:2] == (3, "__request_refused__")
+            assert calls == 2
+        finally:
+            writable.set()
+            release.set()
+        replies = {receive(peer)[0], receive(peer)[0]}
+        assert replies == {1, 2}
+        send(peer, 4)
+        assert receive(peer)[:2] == (4, "noop")
+
+
+def test_blocked_response_allows_other_peer_and_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow peer must not stall another peer or server shutdown."""
+    failed = threading.Event()
+    closed = threading.Event()
+    original_send = zmq.Socket.send_multipart
+
+    def handler() -> str:
+        return "ok"
+
+    with running_server(handler) as (server, peer):
+
+        def send_other_responses(
+            socket: zmq.Socket, frames: list[bytes], flags: int = 0
+        ) -> None:
+            if socket is server.socket and msgspec.msgpack.decode(frames[1]) == 1:
+                failed.set()
+                raise zmq.Again()
+            original_send(socket, frames, flags=flags)
+
+        monkeypatch.setattr(zmq.Socket, "send_multipart", send_other_responses)
+        next_peer = server.ctx.socket(zmq.DEALER)
+        next_peer.setsockopt(zmq.RCVTIMEO, 3000)
+        next_peer.connect(peer.getsockopt_string(zmq.LAST_ENDPOINT))
+        try:
+            send(peer, 1)
+            assert failed.wait(3)
+            send(next_peer, 2)
+            assert receive(next_peer)[:2] == (2, "noop")
+
+            def close() -> None:
+                server.close()
+                closed.set()
+
+            thread = threading.Thread(target=close)
+            thread.start()
+            thread.join(timeout=3)
+            assert closed.is_set()
+            server.close()
+        finally:
+            next_peer.close(linger=0)
+
+
+def test_concurrent_tcp_replies_complete_without_fault_injection() -> None:
+    """Concurrent callers sharing one client must receive every accepted reply."""
+
+    def handler() -> str:
+        return "ok"
+
+    with running_server(handler) as (server, peer):
+        client = MessageQueueClient(
+            peer.getsockopt_string(zmq.LAST_ENDPOINT), server.ctx
+        )
+
+        def request_loop() -> None:
+            for _ in range(5000):
+                assert client.submit_request("noop", []).result(timeout=3) == "ok"
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                tasks = [pool.submit(request_loop) for _ in range(2)]
+                for task in tasks:
+                    task.result(timeout=30)
+        finally:
+            client.close()
