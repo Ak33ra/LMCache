@@ -61,7 +61,7 @@ _MAX_RESIDENT_QUERY = 16_384
 async def resident_cache_objects(
     body: ResidentObjectsRequest, request: Request
 ) -> dict[str, list[bool]]:
-    """Query stable L1 membership without locks, recency, or data transfer."""
+    """Query stable L1 membership without pins, recency, or data transfer."""
     if len(body.keys) > _MAX_RESIDENT_QUERY:
         raise HTTPException(400, "too many keys in resident query")
     try:
