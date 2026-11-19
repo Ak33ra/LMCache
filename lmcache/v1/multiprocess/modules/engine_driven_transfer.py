@@ -34,6 +34,8 @@ from lmcache.v1.multiprocess.engine_module import (
     ModuleBuildContext,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
+from lmcache.v1.multiprocess.token_codec import unpack_token_ids
+from lmcache.v1.multiprocess.token_hasher import TokenHasher
 from lmcache.v1.multiprocess.transfer_context.base import EngineDrivenContextMetadata
 from lmcache.v1.multiprocess.transport.request_limits import RequestLimits
 from lmcache.v1.periodic_thread import (
@@ -621,6 +623,9 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         st = session.extras.pop("store_start_time", None)
         result = False
         try:
+            self._publish_token_bindings(
+                key, self._resolve_single_group_obj_keys(key)
+            )
             result = strategy.commit_store(
                 key=key,
                 instance_id=instance_id,
@@ -641,6 +646,44 @@ class EngineDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 time.perf_counter() - st,
             )
         return result
+
+    def _publish_token_bindings(
+        self, key: IPCCacheServerKey, obj_keys: list[ObjectKey]
+    ) -> None:
+        """Publish chunk tokens before storage emits write-finished events."""
+        chunk_size = self._ctx.chunk_size
+        token_ids = unpack_token_ids(key.token_bytes)
+        effective_len = min(len(token_ids), key.end)
+        num_complete = effective_len - effective_len % chunk_size
+        offsets = list(range(key.start, num_complete, chunk_size))
+        chunks = [token_ids[offset : offset + chunk_size] for offset in offsets]
+        if (
+            not chunks
+            or len(obj_keys) != len(chunks)
+            or any(not isinstance(value, ObjectKey) for value in obj_keys)
+        ):
+            return
+        parents: list[bytes | None] = [None] * len(obj_keys)
+        for index in range(1, len(obj_keys)):
+            parents[index] = obj_keys[index - 1].chunk_hash
+        if key.start >= chunk_size:
+            session = self._ctx.session_manager.get(key.request_id)
+            if session is not None:
+                previous = session.get_hashes(key.start - chunk_size, key.start)
+                if previous:
+                    parents[0] = TokenHasher.hash_to_bytes(previous[0])
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_TOKENS,
+                session_id=key.request_id,
+                metadata={
+                    "chunk_hashes": [value.chunk_hash for value in obj_keys],
+                    "token_chunks": chunks,
+                    "token_offsets": offsets,
+                    "parent_hashes": parents,
+                },
+            )
+        )
 
     @request_handler(
         HandlerType.BLOCKING,
