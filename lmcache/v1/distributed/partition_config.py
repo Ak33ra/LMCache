@@ -36,6 +36,9 @@ class PartitionConfig:
         staging_bytes: Permanent L1 backing reserved for temporary operations.
         sdk_scratch_bytes: Explicit SDK scratch allowance, checked at activation.
         alpha: Requested private fraction of the retained capacity, in [0, 1].
+        allocation_unit_bytes: Optional minimum segment size. A page-aligned
+            power of two; omission uses the native granule. Larger units reduce
+            registrations but round private capacity in larger increments.
 
     Raises:
         ValueError: Values are invalid, unaligned, or leave no retained budget.
@@ -48,6 +51,7 @@ class PartitionConfig:
     staging_bytes: int
     sdk_scratch_bytes: int
     alpha: float
+    allocation_unit_bytes: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("total_bytes", "staging_bytes", "sdk_scratch_bytes"):
@@ -58,11 +62,15 @@ class PartitionConfig:
             raise ValueError("staging_bytes must be a multiple of the page size")
         if self.total_bytes <= self.staging_bytes + self.sdk_scratch_bytes:
             raise ValueError("total_bytes must exceed staging and SDK reserves")
+        if self.allocation_unit_bytes is not None:
+            self._validate_granularity(
+                self.allocation_unit_bytes, "allocation_unit_bytes"
+            )
         self._validate_alpha(self.alpha)
 
     @classmethod
     def from_dict(cls, values: dict[str, object]) -> "PartitionConfig":
-        """Parse exactly the four partition fields from a configuration object.
+        """Parse required budgets and alpha, plus an optional allocation unit.
 
         Args:
             values: JSON-compatible mapping with explicit byte counts and alpha.
@@ -71,11 +79,12 @@ class PartitionConfig:
             ValueError: Fields are missing, unknown, or invalid.
         """
         fields = {"total_bytes", "staging_bytes", "sdk_scratch_bytes", "alpha"}
-        if set(values) != fields:
+        allowed = fields | {"allocation_unit_bytes"}
+        if fields - set(values) or set(values) - allowed:
             raise ValueError(
                 "Partition fields differ: "
                 f"missing={sorted(fields - set(values))}, "
-                f"unknown={sorted(set(values) - fields)}"
+                f"unknown={sorted(set(values) - allowed)}"
             )
         return cls(**values)  # type: ignore[arg-type]
 
@@ -86,7 +95,8 @@ class PartitionConfig:
 
         Args:
             granularity_bytes: Native-reported segment granule; a page-aligned
-                power of two. Private and shared use the same granule.
+                power of two. Private and shared use the larger of this granule
+                and allocation_unit_bytes, when configured.
             alpha: Optional resize target. Omission uses the configured alpha.
                 Its shortest decimal representation defines the requested ratio.
 
@@ -96,13 +106,9 @@ class PartitionConfig:
         Raises:
             ValueError: Granularity or alpha is invalid, or no segment fits.
         """
-        if (
-            type(granularity_bytes) is not int
-            or granularity_bytes < mmap.PAGESIZE
-            or granularity_bytes > sys.maxsize
-            or granularity_bytes & (granularity_bytes - 1)
-        ):
-            raise ValueError("granularity_bytes must be a page-aligned power of two")
+        self._validate_granularity(granularity_bytes, "granularity_bytes")
+        if self.allocation_unit_bytes is not None:
+            granularity_bytes = max(granularity_bytes, self.allocation_unit_bytes)
         fraction = self.alpha if alpha is None else alpha
         self._validate_alpha(fraction)
         available = self.total_bytes - self.staging_bytes - self.sdk_scratch_bytes
@@ -122,6 +128,16 @@ class PartitionConfig:
             unassigned_bytes=available - retained,
             effective_alpha=private / retained,
         )
+
+    @staticmethod
+    def _validate_granularity(value: int, name: str) -> None:
+        if (
+            type(value) is not int
+            or value < mmap.PAGESIZE
+            or value > sys.maxsize
+            or value & (value - 1)
+        ):
+            raise ValueError(f"{name} must be a page-aligned power of two")
 
     @staticmethod
     def _validate_alpha(alpha: float) -> None:

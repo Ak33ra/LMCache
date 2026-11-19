@@ -136,6 +136,7 @@ class Controls:
 
 def setup(
     alpha: float = 0.5,
+    allocation_unit_bytes: int | None = None,
 ) -> tuple[PartitionManager, L1Manager, SegmentedDRAML1MemoryManager, Controls]:
     pool = SegmentedDRAML1MemoryManager(align_bytes=PAGE)
     pool.add_segment(PAGE)
@@ -149,7 +150,7 @@ def setup(
     )
     controls = Controls()
     manager = PartitionManager(
-        PartitionConfig(6 * PAGE, PAGE, PAGE, alpha),
+        PartitionConfig(6 * PAGE, PAGE, PAGE, alpha, allocation_unit_bytes),
         pool,
         l1,
         controls,
@@ -191,6 +192,37 @@ def test_cycles_rounding_and_idempotency() -> None:
             )
             with pytest.raises(RuntimeError, match="another target"):
                 manager.request_resize(request_id, 0.7)
+        assert manager.close()
+        assert pool.get_memory_usage() == (0, 0)
+    finally:
+        assert manager.close()
+        l1.close()
+
+
+def test_larger_units_release_backing_before_reassigning_it() -> None:
+    """Larger private and shared segments keep the same physical envelope."""
+    manager, l1, pool, controls = setup(allocation_unit_bytes=2 * PAGE)
+    try:
+        manager.initialize()
+        controls.fail_release = True
+        manager.request_resize("blocked-large-unit", 1.0)
+        wait(manager, "blocked-large-unit", ResizePhase.FAILED)
+        assert manager.get_status().mapped_bytes == 3 * PAGE
+        assert controls.snapshot().shared_allocated_bytes == 2 * PAGE
+        controls.fail_release = False
+        for index, alpha in enumerate((0.0, 1.0, 0.5)):
+            request_id = f"large-unit-{index}"
+            manager.request_resize(request_id, alpha)
+            wait(manager, request_id)
+            status = manager.get_status()
+            assert status.current.granularity_bytes == 2 * PAGE
+            assert status.current.private_effective_bytes == alpha * 4 * PAGE
+            assert status.charged_bytes == 6 * PAGE
+            assert status.mapped_bytes == PAGE + alpha * 4 * PAGE
+            assert all(
+                segment.size == 2 * PAGE
+                for segment in controls.snapshot().shared_segments
+            )
         assert manager.close()
         assert pool.get_memory_usage() == (0, 0)
     finally:

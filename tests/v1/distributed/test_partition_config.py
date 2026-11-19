@@ -133,8 +133,48 @@ def test_explicit_configuration_fields() -> None:
         "alpha": CONFIG.alpha,
     }
     assert PartitionConfig.from_dict(values) == CONFIG
+    assert PartitionConfig.from_dict(
+        {**values, "allocation_unit_bytes": 32 * MIB}
+    ) == replace(CONFIG, allocation_unit_bytes=32 * MIB)
     with pytest.raises(ValueError, match="unknown"):
         PartitionConfig.from_dict({**values, "private_bytes": MIB})
     del values["alpha"]
     with pytest.raises(ValueError, match="missing"):
         PartitionConfig.from_dict(values)
+
+
+@pytest.mark.parametrize("index", range(11))
+def test_large_allocation_units_preserve_static_sweep_capacity(index: int) -> None:
+    """Forty GiB retains every decimal alpha step with one-GiB segments."""
+    gib = 1024 * MIB
+    config = replace(
+        CONFIG,
+        total_bytes=40 * gib + 24 * MIB,
+        allocation_unit_bytes=gib,
+    )
+    capacity = config.capacity(GRANULE, alpha=index / 10)
+    assert capacity.granularity_bytes == gib
+    assert capacity.private_effective_bytes == index * 4 * gib
+    assert capacity.shared_effective_bytes == (10 - index) * 4 * gib
+    assert capacity.unassigned_bytes == 0
+
+
+def test_allocation_unit_respects_native_alignment_and_reports_rounding() -> None:
+    """A smaller requested unit cannot split a native segment."""
+    assert replace(CONFIG, allocation_unit_bytes=4096).capacity(GRANULE) == (
+        CONFIG.capacity(GRANULE)
+    )
+    capacity = replace(CONFIG, allocation_unit_bytes=32 * MIB, alpha=0.3).capacity(
+        GRANULE
+    )
+    assert capacity.private_requested_bytes > 0
+    assert capacity.private_effective_bytes == 0
+    assert capacity.shared_effective_bytes == 64 * MIB
+    with pytest.raises(ValueError, match="one native segment"):
+        replace(CONFIG, allocation_unit_bytes=128 * MIB).capacity(GRANULE)
+
+
+@pytest.mark.parametrize("value", [True, 0, 2048, 4097, 3 * MIB, 1 << 64, 1.5])
+def test_invalid_allocation_unit_is_rejected(value: object) -> None:
+    with pytest.raises(ValueError, match="allocation_unit_bytes"):
+        replace(CONFIG, allocation_unit_bytes=value)

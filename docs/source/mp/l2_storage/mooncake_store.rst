@@ -143,7 +143,7 @@ The checked-in probe is
 Opt-in private/shared partitioning
 ----------------------------------
 
-The MP server accepts ``--kv-partition`` with four explicit fields:
+The MP server accepts ``--kv-partition`` with four required fields:
 
 .. code-block:: json
 
@@ -158,6 +158,14 @@ gives 48 MiB private and 112 MiB shared. Targets between segment boundaries
 round private capacity down and give the remainder to shared capacity.
 The total bounds managed cache backing. RPC buffers, worker tensors, runtime
 metadata, and process RSS are separate.
+
+For larger caches, the optional ``allocation_unit_bytes`` field reduces the
+number of registered segments. It must be a page-aligned power of two. The
+effective unit is the larger of this value and the native segment granule;
+omitting the field preserves native-granule allocation. For example, a 1 GiB
+unit (``1073741824``) represents all alpha steps of 0.1 exactly with 40 GiB
+retained capacity. Other targets round private capacity down in whole units.
+The temporary reserve retains its separately configured size.
 
 This experimental path requires the fenced CPU TCP SDK, the default MP engine,
 ZMQ, engine-driven typed-inline transfer, and an empty SHM name. Set

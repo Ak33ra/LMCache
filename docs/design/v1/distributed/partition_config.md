@@ -5,7 +5,10 @@ L1 reserve T, SDK scratch allowance S, and requested private fraction alpha.
 It is a validated arithmetic contract. This unit does not allocate memory or
 enable MP partitioning.
 
-For a native-reported segment granule G:
+By default, G is the native-reported segment granule. An optional
+`allocation_unit_bytes` selects a larger uniform allocation unit; G is the
+maximum of the requested unit and the native granule. Both must be page-aligned
+powers of two, so the selected unit remains a native-granule multiple.
 
 ```text
 C = floor((D - T - S) / G) * G
@@ -31,6 +34,13 @@ An 88 MiB budget with 16 MiB temporary reserve and 8 MiB SDK reserve leaves
 requests about 19.2 MiB private but gives effective capacities of 16 MiB private
 and 48 MiB shared. A larger budget permits finer effective alpha increments.
 An 89 MiB budget leaves one additional MiB unassigned.
+
+Large caches can use larger units to reduce registration and segment metadata.
+For example, 40 GiB retained capacity with a 1 GiB unit uses forty segments and
+represents every alpha step of 0.1 exactly (4 GiB). Arbitrary alpha values still
+round down, now in 1 GiB increments. The unit is explicit and fixed for a
+manager's lifetime; the native snapshot continues to report the SDK's actual
+minimum granularity. Temporary backing keeps its separately configured size.
 
 Configuration requires explicit integer byte counts, page-aligned temporary
 backing, and a finite alpha in [0, 1]. Capacity calculation rejects a budget
