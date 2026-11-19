@@ -257,6 +257,27 @@ class LookupModule(DiscoverableModule):
             )
             return
 
+        token_ids = unpack_token_ids(key.token_bytes)
+        chunk_size = self._ctx.chunk_size
+        token_chunks = [
+            token_ids[offset : offset + chunk_size]
+            for offset in range(0, len(chunk_hashes) * chunk_size, chunk_size)
+        ]
+        self._ctx.event_bus.publish(
+            Event(
+                event_type=EventType.MP_TOKENS,
+                session_id=key.request_id,
+                metadata={
+                    "chunk_hashes": chunk_hashes,
+                    "token_chunks": token_chunks,
+                    "token_offsets": list(
+                        range(0, len(chunk_hashes) * chunk_size, chunk_size)
+                    ),
+                    "parent_hashes": [None, *chunk_hashes[:-1]],
+                },
+            )
+        )
+
         # Total chunk-aligned tokens submitted for lookup; surfaces as the
         # denominator of the L1+L2 token-level hit-rate via the
         # ``requested_tokens`` field on ``MP_LOOKUP_PREFETCH_END``.  Sub-chunk
