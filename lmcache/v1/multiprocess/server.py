@@ -63,6 +63,7 @@ from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
 )
 from lmcache.v1.multiprocess.modules.management import ManagementModule
+from lmcache.v1.multiprocess.modules.kv_events import KVEventModule
 from lmcache.v1.multiprocess.transport.base import RequestServer
 from lmcache.v1.multiprocess.transport.request_limits import RequestLimits
 from lmcache.v1.multiprocess.transport.server_factory import create_request_server
@@ -149,6 +150,13 @@ class MPCacheServer:
                 module.clear(force=force)
                 return
         raise RuntimeError("MPCacheServer.clear: no ManagementModule registered")
+
+    def read_kv_events(self, model_name: str, cursor: int, max_events: int):
+        """Return one bounded page from the authoritative CPU event journal."""
+        for module in self._modules:
+            if isinstance(module, KVEventModule):
+                return module.read_kv_events(model_name, cursor, max_events)
+        raise RuntimeError("MPCacheServer.read_kv_events: no KVEventModule registered")
 
 
 @dataclass(frozen=True)
