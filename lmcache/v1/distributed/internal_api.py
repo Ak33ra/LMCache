@@ -388,6 +388,10 @@ class L1ManagerInterface(Protocol):
         """Return already read-locked objects without new locks."""
         ...
 
+    def resident_keys(self, keys: list[ObjectKey]) -> list[bool]:
+        """Report stable resident objects without locking or touching them."""
+        ...
+
     def finish_read(
         self, keys: list[ObjectKey], read_locks: int = 1
     ) -> dict[ObjectKey, L1Error]:

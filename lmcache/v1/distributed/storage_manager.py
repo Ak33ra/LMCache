@@ -1046,6 +1046,18 @@ class StorageManager:
         for adapter in adapters:
             adapter.submit_touch(keys)
 
+    def resident_l1_keys(self, keys: list[ObjectKey]) -> list[bool]:
+        """Return membership across every registered L1 manager."""
+        resident = [False] * len(keys)
+        for manager in self._l1_managers_by_id.values():
+            resident = [
+                current or present
+                for current, present in zip(
+                    resident, manager.resident_keys(keys), strict=True
+                )
+            ]
+        return resident
+
     def delete_l1_keys(
         self, keys: list[ObjectKey], force: bool = False
     ) -> tuple[int, int]:

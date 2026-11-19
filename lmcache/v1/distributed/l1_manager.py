@@ -1646,6 +1646,11 @@ class L1Manager(L1ManagerInterface):
         return self._objects.get(key, None)
 
     @l1_mgr_synchronized
+    def resident_keys(self, keys: list[ObjectKey]) -> list[bool]:
+        """Return membership in the stable resident index without side effects."""
+        return [key in self._objects for key in keys]
+
+    @l1_mgr_synchronized
     def memcheck(self) -> bool:
         """Perform memory check for L1 cache."""
         mem_check_result = self._memory_manager.memcheck()

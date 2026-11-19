@@ -33,6 +33,13 @@ class DeleteObjectsRequest:
 
 
 @dataclass(frozen=True)
+class ResidentObjectsRequest:
+    """Bounded key membership query for the stable L1 resident index."""
+
+    keys: list[EncodedObjectKey]
+
+
+@dataclass(frozen=True)
 class PrefetchRequest:
     """Wire body for ``POST /cache/prefetches``.
 
