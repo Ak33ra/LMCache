@@ -38,6 +38,7 @@ from lmcache.v1.multiprocess.http_apis.schemas import (
     ClearRequest,
     DeleteObjectsRequest,
     PrefetchRequest,
+    ResidentObjectsRequest,
 )
 import lmcache.lmcache_native as lmcache_native
 
@@ -48,11 +49,27 @@ router = APIRouter()
 _MAX_PAGE_SIZE = 5000
 _DEFAULT_PAGE_SIZE = 500
 _CLEAR_TIER = Tier.L1
+_MAX_RESIDENT_QUERY = 16_384
 
 
 # ---------------------------------------------------------------------------
 # Objects -- pass-throughs to ObjectService
 # ---------------------------------------------------------------------------
+
+
+@router.post("/cache/resident", response_model=None)
+async def resident_cache_objects(
+    body: ResidentObjectsRequest, request: Request
+) -> dict[str, list[bool]]:
+    """Query stable L1 membership without locks, recency, or data transfer."""
+    if len(body.keys) > _MAX_RESIDENT_QUERY:
+        raise HTTPException(400, "too many keys in resident query")
+    try:
+        keys = [value.to_object_key() for value in body.keys]
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    storage = get_context(request).engine.storage_manager
+    return {"resident": storage.resident_l1_keys(keys)}
 
 
 @router.get("/cache/objects", response_model=None)
