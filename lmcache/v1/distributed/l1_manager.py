@@ -1648,7 +1648,10 @@ class L1Manager(L1ManagerInterface):
     @l1_mgr_synchronized
     def resident_keys(self, keys: list[ObjectKey]) -> list[bool]:
         """Return membership in the stable resident index without side effects."""
-        return [key in self._objects for key in keys]
+        return [
+            key in self._objects and not self._objects[key].is_temporary
+            for key in keys
+        ]
 
     @l1_mgr_synchronized
     def memcheck(self) -> bool:
