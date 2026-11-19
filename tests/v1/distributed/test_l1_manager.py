@@ -170,6 +170,34 @@ def make_object_key(chunk_hash: int, model_name: str = "test_model", kv_rank: in
     return ObjectKey(chunk_hash=hash_bytes, model_name=model_name, kv_rank=kv_rank)
 
 
+def test_resident_keys_reports_only_stable_retained_objects(
+    basic_l1_config, basic_layout
+):
+    manager = L1Manager(basic_l1_config)
+    retained = make_object_key(1)
+    temporary = make_object_key(2)
+    absent = make_object_key(3)
+
+    manager.reserve_write([retained], [False], basic_layout)
+    assert manager.resident_keys([retained, absent]) == [False, False]
+    manager.finish_write([retained])
+    state = manager.get_object_state(retained)
+    before_locks = (state.read_lock.is_locked(), state.write_lock.is_locked())
+    assert manager.resident_keys([retained, absent]) == [True, False]
+    assert (
+        state.read_lock.is_locked(),
+        state.write_lock.is_locked(),
+    ) == before_locks
+
+    manager.reserve_write([temporary], [True], basic_layout)
+    manager.finish_write([temporary])
+    assert manager.resident_keys([temporary]) == [False]
+
+    assert manager.delete([retained])[retained] == L1Error.SUCCESS
+    assert manager.resident_keys([retained]) == [False]
+    manager.close()
+
+
 # =============================================================================
 # Tests for L1Manager.reserve_read()
 # =============================================================================
