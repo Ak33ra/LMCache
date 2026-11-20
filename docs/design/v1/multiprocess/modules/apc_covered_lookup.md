@@ -135,14 +135,22 @@ existing generation check prevents it from publishing over the current lookup.
 
 ## Independent range lookup
 
-`lookup_range(key, tp_size)` explicitly requests `[key.start, key.end)` within
+`lookup_range(key, tp_size, timeout)` explicitly requests `[key.start, key.end)` within
 one logical request. It computes the same rolling identities from the complete
 token prefix, but copies only the interval's hashes and does not touch earlier
 chunks. Bounds must cover complete chunks within the supplied tokens. Existing
 `lookup` retains the APC semantics above without any signature or wire change.
 
-Range results use absolute chunk boundaries, including partial hits and misses.
-A declined or empty range returns its start. Ranges may be repeated or disjoint;
+The call submits, waits and consumes its exact prefetch job, returning a typed
+`LookupObservation` with absolute `hit_chunks` and per-row `l1_resident_keys`
+and `l2_loaded_keys`. A declined or empty range reports its start. The returned
+immutable receipt is also retained for HTTP inspection. It is captured while
+publishing the generation-checked result, never reread from mutable session
+state. Concurrent replacement or consumption fails the call rather than
+returning another lookup's receipt. A timeout returns `None` and leaves the job
+available to the existing status endpoints and cleanup paths.
+
+Ranges may be repeated or disjoint;
 there is no successful-consumption cursor. Receipt generations, exact owners,
 release behavior and allocation fencing use the same paths as prefix lookup.
 `end_session` retains its existing complete-prefix touch, once per request.
@@ -153,7 +161,9 @@ an entire request. Metrics counters therefore receive zero for those fields;
 tracing leaves these unavailable request-level attributes unset.
 
 Both typed transports expose a separate `lookup_range` operation. ZMQ uses its
-string operation name; gRPC adds `LookupRange` using the existing request and
-response shapes. Older clients retain ordinary lookup behavior on new servers.
+string operation name; gRPC adds `LookupRange` with an explicit timeout and an
+optional typed observation response. Ordinary lookup and wait/status wire
+contracts are unchanged. Older clients retain ordinary lookup behavior on new
+servers.
 Older servers do not implement range lookup and must fail explicitly; callers
 must not fall back to prefix lookup while claiming range semantics.
