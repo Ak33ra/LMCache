@@ -5,7 +5,8 @@
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Callable
+from typing import Any, Callable
+import gc
 import threading
 
 # Third Party
@@ -14,7 +15,11 @@ import pytest
 import zmq
 
 # First Party
-from lmcache.v1.multiprocess.custom_types import KVEventBatch
+from lmcache.v1.multiprocess.custom_types import (
+    IPCCacheServerKey,
+    KVEventBatch,
+    PrepareRetrieveResponse,
+)
 from lmcache.v1.multiprocess.futures import MessagingStream
 from lmcache.v1.multiprocess.request_handler import HandlerType
 from lmcache.v1.multiprocess.rpc import get_rpc_spec
@@ -291,12 +296,12 @@ def test_transient_response_pressure_retries_reply(
     with running_server(handler) as (server, peer):
 
         def send_once_blocked(
-            socket: zmq.Socket, frames: list[bytes], flags: int = 0
+            socket: zmq.Socket, frames: list[bytes], flags: int = 0, **kwargs: Any
         ) -> None:
             if socket is server.socket and not failed.is_set():
                 failed.set()
                 raise zmq.Again()
-            original_send(socket, frames, flags=flags)
+            original_send(socket, frames, flags=flags, **kwargs)
 
         monkeypatch.setattr(zmq.Socket, "send_multipart", send_once_blocked)
         send(peer, 1)
@@ -328,7 +333,7 @@ def test_unsent_response_retains_admission_credit(
     with running_server(handler, blocking=True) as (server, peer):
 
         def send_when_writable(
-            socket: zmq.Socket, frames: list[bytes], flags: int = 0
+            socket: zmq.Socket, frames: list[bytes], flags: int = 0, **kwargs: Any
         ) -> None:
             if (
                 socket is server.socket
@@ -337,7 +342,7 @@ def test_unsent_response_retains_admission_credit(
             ):
                 failed.set()
                 raise zmq.Again()
-            original_send(socket, frames, flags=flags)
+            original_send(socket, frames, flags=flags, **kwargs)
 
         monkeypatch.setattr(zmq.Socket, "send_multipart", send_when_writable)
         try:
@@ -371,12 +376,12 @@ def test_blocked_response_allows_other_peer_and_shutdown(
     with running_server(handler) as (server, peer):
 
         def send_other_responses(
-            socket: zmq.Socket, frames: list[bytes], flags: int = 0
+            socket: zmq.Socket, frames: list[bytes], flags: int = 0, **kwargs: Any
         ) -> None:
             if socket is server.socket and msgspec.msgpack.decode(frames[1]) == 1:
                 failed.set()
                 raise zmq.Again()
-            original_send(socket, frames, flags=flags)
+            original_send(socket, frames, flags=flags, **kwargs)
 
         monkeypatch.setattr(zmq.Socket, "send_multipart", send_other_responses)
         next_peer = server.ctx.socket(zmq.DEALER)
@@ -423,3 +428,39 @@ def test_concurrent_tcp_replies_complete_without_fault_injection() -> None:
                     task.result(timeout=30)
         finally:
             client.close()
+
+
+def test_large_reply_owns_bytes_after_later_replies_and_close() -> None:
+    """Decoded payloads survive ZMQ frame release and socket shutdown."""
+    context = zmq.Context()
+    size = 256 * 1024
+    server = MessageQueueServer(
+        "tcp://127.0.0.1:*", context, RequestLimits(2 * size, 2, 4 * size)
+    )
+
+    def prepare(key: IPCCacheServerKey, instance_id: int) -> PrepareRetrieveResponse:
+        return PrepareRetrieveResponse(success=True, data=bytes([instance_id]) * size)
+
+    server.add_handler("prepare_retrieve", HandlerType.BLOCKING, prepare)
+    server.add_normal_thread_pool(["prepare_retrieve"], max_workers=1)
+    server.start()
+    client = MessageQueueClient(
+        server.socket.getsockopt_string(zmq.LAST_ENDPOINT), context
+    )
+    key = IPCCacheServerKey.from_token_ids("test", 1, 0, [1], end=1)
+    responses = []
+    try:
+        for index in range(12):
+            response = client.submit_request("prepare_retrieve", [key, index]).result(
+                timeout=3
+            )
+            assert response.success
+            assert isinstance(response.data, bytes)
+            responses.append(response)
+    finally:
+        client.close()
+        server.close()
+        context.term()
+    gc.collect()
+    for index, response in enumerate(responses):
+        assert response.data == bytes([index]) * size
