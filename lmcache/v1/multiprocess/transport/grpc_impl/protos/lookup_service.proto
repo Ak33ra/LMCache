@@ -15,6 +15,22 @@ message LookupRequest {
 
 message LookupResponse {}
 
+message LookupRangeRequest {
+  IpcCacheServerKey key = 1;
+  int64 tp_size = 2;
+  double timeout = 3;
+}
+
+message LookupObservation {
+  int64 hit_chunks = 1;
+  repeated int64 l1_resident_keys = 2;
+  repeated int64 l2_loaded_keys = 3;
+}
+
+message LookupRangeResponse {
+  optional LookupObservation observation = 1;
+}
+
 message QueryPrefetchStatusRequest {
   string request_id = 1;
 }
@@ -54,7 +70,7 @@ message EndSessionResponse {}
 
 service LookupService {
   rpc Lookup(LookupRequest) returns (LookupResponse);
-  rpc LookupRange(LookupRequest) returns (LookupResponse);
+  rpc LookupRange(LookupRangeRequest) returns (LookupRangeResponse);
   rpc QueryPrefetchStatus(QueryPrefetchStatusRequest)
       returns (QueryPrefetchStatusResponse);
   rpc WaitPrefetchStatus(WaitPrefetchStatusRequest)
