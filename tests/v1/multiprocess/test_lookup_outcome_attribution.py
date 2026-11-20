@@ -140,9 +140,10 @@ def _end_metadata(
         if group_layouts_found
         else {}
     )
-    ctx.session_manager.get_or_create.return_value.get_hashes.return_value = (
-        chunk_hashes
+    preparation = (
+        ctx.session_manager.get_or_create.return_value.prepare_lookup.return_value
     )
+    preparation.chunk_hashes = chunk_hashes
     ctx.storage_manager.submit_prefetch_task.return_value = PrefetchHandle(
         prefetch_request_id=0,
         external_request_id="req-1",
