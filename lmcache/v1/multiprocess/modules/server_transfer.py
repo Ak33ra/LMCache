@@ -4,6 +4,7 @@
 # Standard
 from _thread import LockType
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 from typing import TYPE_CHECKING, Any
 import abc
 
@@ -399,10 +400,13 @@ class InlineTransferStrategy(TransferStrategy):
 
         group_chunks: list[list[torch.Tensor]] = []
         tensor_bytes = 0
-        for g_keys in group_keys:
-            with self._storage_manager.read_prefetched_operations(
-                g_keys, l1_owners=owners
-            ) as memory_objs:
+        with ExitStack() as read_operations:
+            for g_keys in group_keys:
+                memory_objs = read_operations.enter_context(
+                    self._storage_manager.read_prefetched_operations(
+                        g_keys, l1_owners=owners
+                    )
+                )
                 if memory_objs is None:
                     return PrepareRetrieveResponse(success=False, data=b"", context={})
                 chunks: list[torch.Tensor] = []
@@ -416,22 +420,21 @@ class InlineTransferStrategy(TransferStrategy):
                     )
                     if self._request_limits is not None:
                         self._request_limits.check_workspace_bytes(3 * tensor_bytes)
-                    chunks.append(memory_obj.tensor.cpu().clone())
+                    chunks.append(memory_obj.tensor.cpu())
                 group_chunks.append(chunks)
-
-        if multi_group:
-            firsts = list(group_first_chunk) or [0] * len(group_keys)
-            data = encode_grouped_tensors(
-                [
-                    (list(range(first, first + len(chunks))), chunks)
-                    for first, chunks in zip(firsts, group_chunks, strict=True)
-                ]
-            )
-        else:
-            data = encode_tensors(group_chunks[0])
-        if self._request_limits is not None:
-            self._request_limits.check_payload_bytes(len(data))
-        return PrepareRetrieveResponse(success=True, data=data, context={})
+            if multi_group:
+                firsts = list(group_first_chunk) or [0] * len(group_keys)
+                data = encode_grouped_tensors(
+                    [
+                        (list(range(first, first + len(chunks))), chunks)
+                        for first, chunks in zip(firsts, group_chunks, strict=True)
+                    ]
+                )
+            else:
+                data = encode_tensors(group_chunks[0])
+            if self._request_limits is not None:
+                self._request_limits.check_payload_bytes(len(data))
+            return PrepareRetrieveResponse(success=True, data=data, context={})
 
     def commit_retrieve(
         self,

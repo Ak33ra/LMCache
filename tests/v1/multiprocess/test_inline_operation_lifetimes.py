@@ -80,10 +80,10 @@ def test_inline_copy_survives_expiry_and_forced_clear(
         assert strategy.commit_store(IPC_KEY, 1, payload, CONTEXT, lambda _: [KEY])
         manager.reserve_read([KEY])
     entered, release = threading.Event(), threading.Event()
-    method = "copy_" if direction == "store" else "clone"
+    method = "copy_" if direction == "store" else "numpy"
     original = getattr(torch.Tensor, method)
 
-    def paused(tensor: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+    def paused(tensor: torch.Tensor, *args: object, **kwargs: object) -> object:
         entered.set()
         assert release.wait(10)
         return original(tensor, *args, **kwargs)
@@ -153,7 +153,7 @@ def test_inline_copy_failure_releases_exact_operations(
         raise RuntimeError("copy failed")
 
     monkeypatch.setattr(
-        torch.Tensor, "copy_" if direction == "store" else "clone", fail
+        torch.Tensor, "copy_" if direction == "store" else "numpy", fail
     )
     with pytest.raises(RuntimeError, match="copy failed"):
         if direction == "store":

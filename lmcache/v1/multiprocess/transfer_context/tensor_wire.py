@@ -107,7 +107,7 @@ def _encode_frames(
         if len(shape) > 16:
             raise ValueError("Inline tensor rank exceeds 16")
         raw = memoryview(
-            tensor.detach().contiguous().view(torch.uint8).numpy().tobytes()
+            tensor.detach().contiguous().view(torch.uint8).reshape(-1).numpy()
         )
         if len(raw) > _MAX_TENSOR_BYTES:
             raise ValueError("Inline tensor exceeds 2 GiB")

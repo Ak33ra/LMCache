@@ -59,6 +59,20 @@ def test_tensor_wire_decoded_tensor_keeps_payload_alive() -> None:
     assert torch.equal(decoded[0], torch.arange(8, dtype=torch.float32))
 
 
+def test_tensor_wire_payload_owns_source_bytes() -> None:
+    """Keep encoded bytes stable after the source tensor changes."""
+    source = torch.arange(8, dtype=torch.float32)
+    payload = encode_tensors([source])
+    source.zero_()
+    (decoded,) = decode_tensors(
+        payload,
+        expected_shape=torch.Size([8]),
+        expected_dtype=torch.float32,
+        expected_count=1,
+    )
+    assert torch.equal(decoded, torch.arange(8, dtype=torch.float32))
+
+
 def test_tensor_wire_rejects_unknown_fields() -> None:
     """Reject fields outside the versioned typed schema."""
     payload = msgspec.msgpack.encode(
