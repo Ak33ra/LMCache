@@ -306,6 +306,11 @@ class LookupModule(DiscoverableModule):
                     metadata={
                         "request_id": key.request_id,
                         "chunk_hashes": chunk_hashes,
+                        **(
+                            {"hash_start_chunk": key.start // self._ctx.chunk_size}
+                            if range_lookup
+                            else {}
+                        ),
                         "model_name": model_name,
                         "chunk_size": self._ctx.chunk_size,
                         "seq_len": key.num_tokens,

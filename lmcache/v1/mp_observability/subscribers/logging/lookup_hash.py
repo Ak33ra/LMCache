@@ -160,6 +160,8 @@ class LookupHashLoggingSubscriber(EventSubscriber):
                 for h in chunk_hashes_raw
             ],
         }
+        if "hash_start_chunk" in meta:
+            data["hash_start_chunk"] = meta["hash_start_chunk"]
         line = json.dumps(data) + "\n"
         if self._current_handle is not None:
             self._current_handle.write(line)
