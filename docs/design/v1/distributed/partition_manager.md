@@ -72,6 +72,21 @@ boundary excludes unconverted GPU/SHM, plugin, P2P, and trace paths. Bounded ZMQ
 credits and inline tensor workspace checks constrain accepted request work
 separately from the cache-backing budget.
 
+`RequestLimits.for_partition(staging_bytes)` derives auxiliary admission from
+the configured staging reserve. The accepted aggregate wire ceiling is half
+that reserve, clamped to 8--64 MiB. Each handler's tensor workspace ceiling is
+four times the wire ceiling, at most 256 MiB. Four request credits remain held
+through handler completion and response enqueue or disposal. A 16 MiB reserve
+therefore retains the original 8 MiB wire and 32 MiB workspace limits; 128 MiB
+staging permits 64 MiB wire and 256 MiB workspace. Envelope and identity bytes
+count toward the wire ceiling, so a tensor tile cannot occupy the whole limit.
+
+These are ceilings on accepted work, not additional managed backing or an RSS
+bound. Worker payloads, rejected-input transients, socket buffers and runtime
+metadata remain outside the managed budget. Increasing staging while keeping
+retained private/shared capacity fixed requires increasing `total_bytes` by the
+same amount. SDK scratch remains a separate, explicitly matched native reserve.
+
 ## Verification
 
 Run from the LMCache checkout:

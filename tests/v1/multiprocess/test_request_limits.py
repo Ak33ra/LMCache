@@ -28,15 +28,20 @@ from lmcache.v1.multiprocess.transport.zmq_impl.wire import (
     encode_operation,
 )
 
+TEST_LIMITS = RequestLimits(1024, 2, 2048)
+
 
 @contextmanager
 def running_server(
-    handler: Callable[[], str], *, blocking: bool = False
+    handler: Callable[[], str],
+    *,
+    blocking: bool = False,
+    limits: RequestLimits = TEST_LIMITS,
 ) -> Iterator[tuple[MessageQueueServer, zmq.Socket]]:
-    """Run a local server with a two-request limit and a raw DEALER peer."""
+    """Run a bounded local server with a raw DEALER peer."""
     context = zmq.Context()
     address = "tcp://127.0.0.1:*"
-    server = MessageQueueServer(address, context, RequestLimits(1024, 2, 2048))
+    server = MessageQueueServer(address, context, limits)
     server.add_handler(
         "noop", HandlerType.BLOCKING if blocking else HandlerType.SERIALIZED, handler
     )
@@ -167,6 +172,51 @@ def test_workspace_accounts_aggregate_copies() -> None:
     limits.check_workspace_bytes(2048)
     with pytest.raises(ValueError, match="workspace"):
         limits.check_workspace_bytes(2049)
+
+
+@pytest.mark.parametrize(
+    "staging_mib,payload_mib",
+    [(1, 8), (16, 8), (32, 16), (64, 32), (128, 64), (256, 64)],
+)
+def test_partition_admission_scales_with_bounded_staging(
+    staging_mib: int, payload_mib: int
+) -> None:
+    limits = RequestLimits.for_partition(staging_mib << 20)
+    assert limits.max_inflight_requests == 4
+    assert limits.max_payload_bytes == payload_mib << 20
+    assert limits.max_workspace_bytes == 4 * payload_mib << 20
+    limits.check_payload_bytes(limits.max_payload_bytes)
+    limits.check_workspace_bytes(limits.max_workspace_bytes)
+    with pytest.raises(ValueError, match="payload"):
+        limits.check_payload_bytes(limits.max_payload_bytes + 1)
+    with pytest.raises(ValueError, match="workspace"):
+        limits.check_workspace_bytes(limits.max_workspace_bytes + 1)
+
+
+@pytest.mark.parametrize("staging", [0, -1, True, 16.0])
+def test_partition_admission_rejects_invalid_reserve(staging: int) -> None:
+    with pytest.raises(ValueError, match="staging"):
+        RequestLimits.for_partition(staging)
+
+
+def test_large_partition_reply_and_oversize_refusal_recover_credit() -> None:
+    replies = iter([32 << 20, 64 << 20, 2])
+
+    def handler() -> str:
+        return "x" * next(replies)
+
+    with running_server(handler, limits=RequestLimits.for_partition(128 << 20)) as (
+        _,
+        peer,
+    ):
+        send(peer, 1)
+        uid, operation, payloads = receive(peer)
+        assert (uid, operation) == (1, "noop")
+        assert msgspec.msgpack.decode(payloads[0]) == "x" * (32 << 20)
+        send(peer, 2)
+        assert receive(peer)[:2] == (2, "__request_refused__")
+        send(peer, 3)
+        assert receive(peer)[:2] == (3, "noop")
 
 
 def test_stream_subscription_is_refused_before_invocation() -> None:
