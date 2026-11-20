@@ -248,9 +248,11 @@ class LookupModule(DiscoverableModule):
 
         num_kv_readers = key.require_num_kv_readers()
 
-        chunk_hashes = self._ctx.token_hasher.compute_packed_chunk_hashes(
-            key.token_bytes, end=key.end
-        )
+        hash_end = min(key.num_tokens, key.end)
+        hash_end -= hash_end % self._ctx.chunk_size
+        chunk_hashes = [
+            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0, hash_end)
+        ]
         if not chunk_hashes:
             self._register_empty_prefetch_job(
                 key, session, generation, early_exit_reason="empty_chunk_hashes"
@@ -336,9 +338,10 @@ class LookupModule(DiscoverableModule):
             self._ctx.storage_manager.touch_cached_keys(
                 [
                     obj_key
-                    for group_keys in ipc_key_to_object_keys(
+                    for group_keys in session.get_object_keys(
                         key,
-                        chunk_hashes[:start_chunk],
+                        0,
+                        start_chunk * self._ctx.chunk_size,
                         list(range(attn_desc.num_object_groups)),
                     )
                     for obj_key in group_keys
@@ -605,8 +608,15 @@ class LookupModule(DiscoverableModule):
         if not session.prefetch_group_windows:
             return
 
-        chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
-        obj_keys = self._all_object_keys(session.lookup_ipc_key, chunk_hashes)
+        key = session.lookup_ipc_key
+        num_groups = self._ctx.layout_desc_registry.find_attn_desc(
+            key.model_name, key.world_size
+        ).num_object_groups
+        obj_keys = [
+            obj_key
+            for group in session.get_object_keys(key, 0, None, list(range(num_groups)))
+            for obj_key in group
+        ]
         # unified touch of all keys, which include retrieved and stored keys
         # TODO(chunxiaozheng): when l2 is enabled, the prefetched keys from l2 are temp
         #  and will be deleted after finish_read_prefetched, when we touch all keys,
@@ -616,30 +626,6 @@ class LookupModule(DiscoverableModule):
     # -----------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------
-
-    def _all_object_keys(
-        self,
-        key: IPCCacheServerKey,
-        chunk_hashes: list[bytes],
-    ) -> list[ObjectKey]:
-        """Resolve every object key of a request across all object groups.
-
-        The object-group count is read from the layout registry for
-        ``key``'s ``(model_name, world_size)``. The order of the returned keys
-        is unspecified.
-
-        Args:
-            key: The IPC key (model/world/worker, salt).
-            chunk_hashes: Chunk hashes to resolve keys for.
-
-        Returns:
-            The object keys of all groups and kv ranks for ``chunk_hashes``.
-        """
-        num_groups = self._ctx.layout_desc_registry.find_attn_desc(
-            key.model_name, key.world_size
-        ).num_object_groups
-        per_group = ipc_key_to_object_keys(key, chunk_hashes, list(range(num_groups)))
-        return [obj_key for group_keys in per_group for obj_key in group_keys]
 
     def _register_prefetch_job(self, job: _PrefetchJob) -> None:
         with self._prefetch_job_lock:

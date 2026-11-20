@@ -13,7 +13,7 @@ import time
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import ObjectKey, ipc_key_to_object_keys
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.token_codec import TOKEN_STRIDE, num_packed_tokens
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
@@ -66,6 +66,12 @@ class Session:
     prefetch_group_windows: tuple[int, ...] = ()
     _prefetch_owners: dict[ObjectKey, int] = field(default_factory=dict, repr=False)
     extras: dict[str, Any] = field(default_factory=dict)
+    # Only one identity context is retained; switching context drops old keys.
+    _object_key_identity: tuple[str, int, int | None, str, tuple[int, ...]] | None = (
+        field(default=None, repr=False)
+    )
+    _object_key_groups: list[list[ObjectKey]] = field(default_factory=list, repr=False)
+    _object_key_chunks: int = field(default=0, repr=False)
     _lookup_generation: int = field(default=0, repr=False)
     _lookup_observation: LookupObservation | None = field(default=None, repr=False)
     _failed_retrieve_releases: set[tuple[int, int, int, int, int]] = field(
@@ -76,11 +82,21 @@ class Session:
     def set_tokens(self, packed_token_ids: bytes) -> None:
         """Update the token sequence (idempotent, replaces not extends).
 
+        Cached hashes and object identities survive identical updates and
+        prefix extensions. Replacement or truncation invalidates both caches.
+
         Args:
             packed_token_ids: Complete packed token sequence, starting at
                 position 0.
         """
         with self._lock:
+            if not packed_token_ids.startswith(self.tokens):
+                self.chunk_hashes.clear()
+                self.last_prefix_hash = None
+                self.num_chunks_processed = 0
+                self._object_key_identity = None
+                self._object_key_groups.clear()
+                self._object_key_chunks = 0
             self.tokens = packed_token_ids
 
     @overload
@@ -138,6 +154,76 @@ class Session:
             end_chunk = end // chunk_size
             self._compute_hash(end_chunk)
             return self.chunk_hashes[start_chunk:end_chunk]
+
+    def get_object_keys(
+        self,
+        key: IPCCacheServerKey,
+        start: int,
+        end: int | None,
+        object_group_ids: list[int],
+    ) -> list[list[ObjectKey]]:
+        """Resolve cached object identities for a chunk-aligned token range.
+
+        Call set_tokens with the request's current prefix first. Keys retain
+        group-major, then chunk-major/rank-minor order. Only immutable object
+        identities are cached, never residency, locks or allocation generations.
+        A different model, world, worker, salt or group selection replaces the
+        cached identity context. Returned lists can be modified by the caller.
+
+        Args:
+            key: Model, worker and isolation identity for these objects.
+            start: Inclusive, chunk-aligned token index.
+            end: Exclusive, chunk-aligned token index within held tokens,
+                or None to use the last complete chunk under the session lock.
+            object_group_ids: Ordered object groups to resolve.
+
+        Returns:
+            One list of object keys per requested group.
+
+        Raises:
+            ValueError: If the range is invalid or exceeds the held tokens.
+        """
+        chunk_size = self.hasher.chunk_size
+        identity = (
+            key.model_name,
+            key.world_size,
+            key.worker_id,
+            key.cache_salt,
+            tuple(object_group_ids),
+        )
+        with self._lock:
+            if end is None:
+                held = num_packed_tokens(self.tokens)
+                end = held - held % chunk_size
+            if (
+                start < 0
+                or start > end
+                or start % chunk_size
+                or end % chunk_size
+                or end > num_packed_tokens(self.tokens)
+            ):
+                raise ValueError("Object key range must cover held, complete chunks")
+            if identity != self._object_key_identity:
+                self._object_key_identity = identity
+                self._object_key_groups = [[] for _ in object_group_ids]
+                self._object_key_chunks = 0
+            end_chunk = end // chunk_size
+            self._compute_hash(end_chunk)
+            if end_chunk > self._object_key_chunks:
+                hashes = [
+                    TokenHasher.hash_to_bytes(h)
+                    for h in self.chunk_hashes[self._object_key_chunks : end_chunk]
+                ]
+                additions = ipc_key_to_object_keys(key, hashes, object_group_ids)
+                for cached, added in zip(
+                    self._object_key_groups, additions, strict=True
+                ):
+                    cached.extend(added)
+                self._object_key_chunks = end_chunk
+            ranks = key.world_size if key.worker_id is None else 1
+            first = start // chunk_size * ranks
+            last = end_chunk * ranks
+            return [group[first:last] for group in self._object_key_groups]
 
     def _compute_hash(self, end_chunk: int) -> None:
         """Compute rolling hashes up to end_chunk.

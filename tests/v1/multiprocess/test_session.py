@@ -2,6 +2,7 @@
 """Tests for Session and SessionManager."""
 
 # Standard
+from dataclasses import replace
 import threading
 import time
 
@@ -9,6 +10,7 @@ import time
 import pytest
 
 # First Party
+from lmcache.v1.distributed.api import ipc_key_to_object_keys
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.session import Session, SessionManager
 from lmcache.v1.multiprocess.token_codec import pack_token_ids, unpack_token_ids
@@ -358,3 +360,84 @@ class TestSessionManagerRemoveReturnsSession:
         """remove() on a non-existent request_id should return None."""
         mgr = SessionManager(hasher, ttl=600, cleanup_interval=None)
         assert mgr.remove("no-such-id") is None
+
+
+class TestSessionObjectKeys:
+    @staticmethod
+    def key(tokens: list[int]) -> IPCCacheServerKey:
+        return IPCCacheServerKey.from_token_ids(
+            model_name="model",
+            world_size=2,
+            worker_id=None,
+            token_ids=tokens,
+            start=0,
+            end=len(tokens),
+            request_id="req-1",
+            num_kv_readers=1,
+        )
+
+    def test_extension_reuses_identities(self, session: Session) -> None:
+        first = self.key(list(range(8)))
+        session.set_tokens(first.token_bytes)
+        old = session.get_object_keys(first, 0, 8, [0, 1])
+        extended = self.key(list(range(16)))
+        session.set_tokens(extended.token_bytes)
+        current = session.get_object_keys(extended, 0, 16, [0, 1])
+        expected = ipc_key_to_object_keys(
+            extended, session.hasher.compute_chunk_hashes(list(range(16))), [0, 1]
+        )
+        assert current == expected
+        assert all(current[g][i] is old[g][i] for g in range(2) for i in range(4))
+        current[0].clear()
+        assert session.get_object_keys(extended, 0, 16, [0, 1]) == expected
+
+    @pytest.mark.parametrize("tokens", [list(range(4)), [9] * 8, list(range(6))])
+    def test_replacement_invalidates_cached_prefix(
+        self, session: Session, tokens: list[int]
+    ) -> None:
+        original = self.key(list(range(12)))
+        session.set_tokens(original.token_bytes)
+        session.get_object_keys(original, 0, 12, [0])
+        session.set_tokens(pack_token_ids(tokens))
+        extended_tokens = tokens + [42] * (12 - len(tokens))
+        changed = self.key(extended_tokens)
+        session.set_tokens(changed.token_bytes)
+        expected_hashes = session.hasher.compute_chunk_hashes(extended_tokens)
+        assert session.get_hashes(0, 12) == expected_hashes
+        assert session.get_object_keys(changed, 0, 12, [0]) == ipc_key_to_object_keys(
+            changed, expected_hashes, [0]
+        )
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("cache_salt", "other"),
+            ("model_name", "other"),
+            ("world_size", 3),
+            ("worker_id", 0),
+            ("worker_id", 1),
+        ],
+    )
+    def test_identity_changes_do_not_alias(
+        self, session: Session, field: str, value: str | int
+    ) -> None:
+        key = self.key(list(range(8)))
+        session.set_tokens(key.token_bytes)
+        original = session.get_object_keys(key, 0, 8, [0])
+        changed = replace(key, **{field: value})
+        expected = ipc_key_to_object_keys(
+            changed, session.hasher.compute_chunk_hashes(list(range(8))), [0]
+        )
+        assert session.get_object_keys(changed, 0, 8, [0]) == expected
+        assert expected != original
+        assert session.get_object_keys(key, 0, 8, [0]) == original
+
+    def test_group_and_range_order(self, session: Session) -> None:
+        key = self.key(list(range(12)))
+        session.set_tokens(key.token_bytes)
+        session.get_object_keys(key, 0, 12, [0, 1])
+        assert session.get_object_keys(key, 4, 8, [1, 0]) == ipc_key_to_object_keys(
+            key, session.hasher.compute_chunk_hashes(list(range(12)))[1:2], [1, 0]
+        )
+        with pytest.raises(ValueError):
+            session.get_object_keys(key, 0, 16, [0])

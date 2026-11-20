@@ -26,7 +26,9 @@ import pytest
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
+from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_codec import pack_token_ids
+from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 # Test helpers
 from tests.v1.mp_scheduler_adapter_test_utils import (
@@ -281,6 +283,9 @@ def test_shrink_cannot_recur_once_fallen_back():
 def _lookup_ctx(n_chunks: int) -> MagicMock:
     """Mock engine context sufficient to drive ``LookupModule.lookup``."""
     ctx = _ctx_with_hashes(n_chunks)
+    ctx.session_manager = SessionManager(
+        TokenHasher(CHUNK_SIZE, "blake3"), cleanup_interval=None
+    )
     ctx.layout_desc_registry.find.return_value = MagicMock()
     ctx.layout_desc_registry.find_attn_desc.return_value = MagicMock(
         num_chunks_in_sw=[-1], num_object_groups=1
@@ -343,10 +348,10 @@ def test_end_session_refreshes_both_tiers():
     from lmcache.v1.multiprocess.modules.lookup import LookupModule
 
     ctx = _lookup_ctx(4)
-    session = MagicMock()
-    session.lookup_ipc_key = _make_key(4)
-    session.get_hashes.return_value = [1, 2, 3, 4]
-    ctx.session_manager.remove.return_value = session
+    session = ctx.session_manager.get_or_create("r")
+    key = _make_key(4)
+    session.set_tokens(key.token_bytes)
+    session.begin_lookup(key, (-1,))
 
     LookupModule(ctx).end_session("r")
 
@@ -374,3 +379,33 @@ def test_serde_wrapper_forwards_touch_to_the_inner_adapter():
     SerdeL2AdapterWrapper.submit_touch(wrapper, keys)
 
     inner.submit_touch.assert_called_once_with(keys)
+
+
+def test_repeated_session_lookup_refreshes_entire_covered_prefix():
+    """A continued lookup renews recency and replaces its consumed receipt."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.lookup import LookupModule
+
+    ctx = _lookup_ctx(4)
+    module = LookupModule(ctx)
+    session = ctx.session_manager.get_or_create("r")
+    module.lookup(_make_key(2, start_chunks=2), 1)
+    assert module.query_prefetch_status("r") == 2
+    assert session.get_lookup_observation().hit_chunks == 2
+    first_touch = ctx.storage_manager.touch_cached_keys.call_args.args[0]
+
+    module.lookup(_make_key(4, start_chunks=4), 1)
+    assert session.get_lookup_observation() is None
+    assert module.query_prefetch_status("r") == 4
+    assert session.get_lookup_observation().hit_chunks == 4
+    second_touch = ctx.storage_manager.touch_cached_keys.call_args.args[0]
+    assert len(first_touch) == 2
+    assert len(second_touch) == 4
+    assert second_touch[:2] == first_touch
+    assert all(a is b for a, b in zip(first_touch, second_touch[:2], strict=True))
+    ctx.storage_manager.submit_prefetch_task.assert_not_called()
+
+    module.end_session("r")
+    assert ctx.session_manager.get("r") is None
+    assert ctx.storage_manager.touch_cached_keys.call_count == 3
+    assert ctx.storage_manager.touch_cached_keys.call_args.args[0] == second_touch

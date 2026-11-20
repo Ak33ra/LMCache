@@ -110,3 +110,19 @@ sequenceDiagram
         C->>L: free_lookup_locks([0, hit)) - floored to c0
     end
 ```
+
+## Repeated lookups in one session
+
+A session retains rolling chunk hashes and immutable object identities across
+prefix extensions. Replacing or truncating its token prefix invalidates those
+caches. Object identities are scoped by model, world size, worker, isolation
+salt and selected groups; changing that context discards the previous key
+cache. Memory is bounded by the current session prefix and released on session
+removal or expiry. Cached keys do not retain residency or allocation descriptors.
+
+Every admitted lookup still touches its entire covered prefix in both tiers,
+even if the same keys were touched by a preceding lookup. Each lookup also
+starts a fresh generation and clears the prior observation and read owners.
+Callers that perform sequential tiled reads must finish each tile's retrieval
+before beginning the next lookup, then end the session once after the complete
+logical read. Session expiry retains its existing creation-time TTL.
