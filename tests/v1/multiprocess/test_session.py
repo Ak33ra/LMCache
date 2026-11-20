@@ -461,3 +461,57 @@ class TestSessionObjectKeys:
         assert not session.record_prefetch_result(
             3, (), lookup_generation=prepared.generation
         )
+
+
+def test_transfer_identity_resolution_is_atomic(hasher: TokenHasher) -> None:
+    """Concurrent prefixes sharing a request ID retain their own identities."""
+    first_tokens_set = threading.Event()
+    second_started = threading.Event()
+
+    class OverlappingSession(Session):
+        def set_tokens(self, packed_token_ids: bytes) -> None:
+            super().set_tokens(packed_token_ids)
+            if packed_token_ids == first.token_bytes:
+                first_tokens_set.set()
+                if not second_started.wait(5):
+                    raise TimeoutError("Second resolver did not start")
+
+    session = OverlappingSession("shared", hasher)
+    first = IPCCacheServerKey.from_token_ids(
+        model_name="model",
+        world_size=1,
+        worker_id=0,
+        token_ids=list(range(12)),
+        start=4,
+        end=12,
+        request_id="shared",
+    )
+    second = replace(first, token_bytes=pack_token_ids([42] * 12))
+    results: list = [None, None]
+    errors: list[BaseException] = []
+
+    def resolve(index: int, key: IPCCacheServerKey) -> None:
+        try:
+            if index == 1:
+                if not first_tokens_set.wait(5):
+                    raise TimeoutError("First resolver did not set tokens")
+                second_started.set()
+            results[index] = session.resolve_object_keys(key, [0, 1])
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=resolve, args=(i, key))
+        for i, key in enumerate((first, second))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+        assert not thread.is_alive()
+    assert not errors
+    for key, result in zip((first, second), results, strict=True):
+        hashes = hasher.compute_packed_chunk_hashes(
+            key.token_bytes, start=key.start, end=key.end
+        )
+        assert result == ipc_key_to_object_keys(key, hashes, [0, 1])

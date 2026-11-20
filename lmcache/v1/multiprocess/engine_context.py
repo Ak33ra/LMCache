@@ -14,7 +14,6 @@ from lmcache.v1.distributed.api import (
     AttnWindowDesc,
     MemoryLayoutDesc,
     ObjectKey,
-    ipc_key_to_object_keys,
 )
 from lmcache.v1.distributed.config import StorageManagerConfig
 from lmcache.v1.distributed.storage_manager import StorageManager
@@ -417,15 +416,7 @@ class MPCacheServerContext:
             ValueError: If ``key.worker_id`` is ``None``.
         """
         session = self.session_manager.get_or_create(key.request_id)
-        session.set_tokens(key.token_bytes)
-        if session.lookup_ipc_key is None:
-            session.lookup_ipc_key = key.no_worker_id_version()
-        chunk_hashes = [
-            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(key.start, key.end)
-        ]
-        if key.worker_id is None:
-            raise ValueError("Must resolve keys with worker_id != None")
-        return ipc_key_to_object_keys(key, chunk_hashes, object_group_ids)
+        return session.resolve_object_keys(key, object_group_ids)
 
     @staticmethod
     def _compute_shm_pool_info(
