@@ -235,6 +235,35 @@ class Session:
             last = end_chunk * ranks
             return [group[first:last] for group in self._object_key_groups]
 
+    def resolve_object_keys(
+        self,
+        key: IPCCacheServerKey,
+        object_group_ids: list[int],
+    ) -> list[list[ObjectKey]]:
+        """Resolve transfer identities atomically from the exact request tokens.
+
+        Args:
+            key: Worker-specific identity, complete tokens and transfer range.
+            object_group_ids: Ordered groups to resolve.
+
+        Returns:
+            Object keys in group-major, then chunk-major order.
+
+        Raises:
+            ValueError: If the worker is unspecified or the range is invalid.
+        """
+        if key.worker_id is None:
+            raise ValueError("Must resolve keys with worker_id != None")
+        with self._lock:
+            self.set_tokens(key.token_bytes)
+            if self.lookup_ipc_key is None:
+                self.lookup_ipc_key = key.no_worker_id_version()
+            hashes = [
+                TokenHasher.hash_to_bytes(h)
+                for h in self.get_hashes(key.start, key.end)
+            ]
+            return ipc_key_to_object_keys(key, hashes, object_group_ids)
+
     def _compute_hash(self, end_chunk: int) -> None:
         """Compute rolling hashes up to end_chunk.
 
