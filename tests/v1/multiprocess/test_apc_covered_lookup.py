@@ -465,10 +465,11 @@ def test_range_lookup_preserves_identity_without_covered_touches():
     from lmcache.v1.multiprocess.modules.lookup import LookupModule
 
     ctx = _lookup_ctx(8)
+    ctx.storage_manager.wait_prefetch_status.return_value = False
     module = LookupModule(ctx)
     for end in (2, 4, 6, 8):
         key = _make_key(end, start_chunks=end - 2)
-        module.lookup_range(key, 1)
+        assert module.lookup_range(key, 1, 0.0) is None
         spec = ctx.storage_manager.submit_prefetch_task.call_args.args[0]
         expected = ipc_key_to_object_keys(
             key,
@@ -501,9 +502,9 @@ def test_range_lookup_receipt_is_absolute_and_not_apc(found: int) -> None:
         l2_hit_cells=[Bitmap(2)],
     )
     module = LookupModule(ctx)
-    module.lookup_range(_make_key(6, start_chunks=4), 1)
-    assert module.query_prefetch_status("r") == 4 + found
-    observation = ctx.session_manager.get("r").get_lookup_observation()
+    observation = module.lookup_range(_make_key(6, start_chunks=4), 1, 1.0)
+    assert observation is ctx.session_manager.get("r").get_lookup_observation()
+    assert module.query_prefetch_status("r") == 0
     assert observation.hit_chunks == 4 + found
     assert observation.l1_resident_keys == (found,)
     event = next(
@@ -526,7 +527,7 @@ def test_declined_range_reports_its_start() -> None:
     policy = MagicMock()
     policy.should_load.return_value = False
     module = LookupModule(ctx, policy)
-    module.lookup_range(_make_key(6, start_chunks=4), 1)
-    assert module.query_prefetch_status("r") == 4
+    observation = module.lookup_range(_make_key(6, start_chunks=4), 1, 1.0)
+    assert observation.hit_chunks == 4
     ctx.storage_manager.submit_prefetch_task.assert_not_called()
     ctx.storage_manager.touch_cached_keys.assert_not_called()

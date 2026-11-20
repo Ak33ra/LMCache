@@ -45,6 +45,7 @@ from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
 )
 from lmcache.v1.multiprocess.modules.lookup import LookupModule
+from lmcache.v1.multiprocess.session import LookupObservation
 from lmcache.v1.multiprocess.modules.management import ManagementModule
 from lmcache.v1.multiprocess.modules.p2p_controller import P2PController
 from lmcache.v1.multiprocess.plugin_modules.qstore import QStoreModule
@@ -131,7 +132,7 @@ _GRPC_SERVER_MODES = ["sync", "aio", _NATIVE_MODE]
 @dataclass
 class _Calls:
     lookup: tuple[IPCCacheServerKey, int] | None = None
-    lookup_range: tuple[IPCCacheServerKey, int] | None = None
+    lookup_range: tuple[IPCCacheServerKey, int, float] | None = None
     allocation: tuple[int, str, list[BlockAllocationRecord]] | None = None
     clear_force: bool | None = None
     chunk_negotiation: int | None = None
@@ -149,8 +150,11 @@ def grpc_client(
             calls.lookup = (key, tp_size)
 
         @request_handler(HandlerType.BLOCKING)
-        def lookup_range(self, key: IPCCacheServerKey, tp_size: int) -> None:
-            calls.lookup_range = (key, tp_size)
+        def lookup_range(
+            self, key: IPCCacheServerKey, tp_size: int, timeout: float
+        ) -> LookupObservation | None:
+            calls.lookup_range = (key, tp_size, timeout)
+            return LookupObservation(7, (2, 1), (3, 4)) if timeout else None
 
         @request_handler(
             HandlerType.BLOCKING,
@@ -634,8 +638,11 @@ def test_generated_grpc_services_communicate_end_to_end(
 
     assert client.lookup(key, 2).result(timeout=5) is None
     assert calls.lookup == (key, 2)
-    assert client.lookup_range(key, 2).result(timeout=5) is None
-    assert calls.lookup_range == (key, 2)
+    assert client.lookup_range(key, 2, 3.0).result(timeout=5) == LookupObservation(
+        7, (2, 1), (3, 4)
+    )
+    assert calls.lookup_range == (key, 2, 3.0)
+    assert client.lookup_range(key, 2, 0.0).result(timeout=5) is None
     assert client.store(key, 7, [[1, 2], [3]], b"input-event").result(5) == (
         b"output-event",
         True,

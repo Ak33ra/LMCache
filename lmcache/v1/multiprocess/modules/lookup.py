@@ -129,6 +129,12 @@ class _PrefetchJob:
     range_lookup: bool = False
 
 
+@dataclass(frozen=True)
+class _PrefetchConsumption:
+    hit_chunks: int
+    observation: LookupObservation | None
+
+
 class LookupModule(DiscoverableModule):
     """Handles lookup, prefetch polling, lock release, and session lifecycle.
 
@@ -211,7 +217,9 @@ class LookupModule(DiscoverableModule):
         self._lookup(key, range_lookup=False)
 
     @request_handler(HandlerType.BLOCKING)
-    def lookup_range(self, key: IPCCacheServerKey, tp_size: int) -> None:
+    def lookup_range(
+        self, key: IPCCacheServerKey, tp_size: int, timeout: float
+    ) -> LookupObservation | None:
         """Submit an independent interval within a logical request.
 
         Unlike lookup, start denotes the interval boundary, not an
@@ -225,10 +233,26 @@ class LookupModule(DiscoverableModule):
         Args:
             key: Complete token prefix and requested interval.
             tp_size: Legacy wire field; ignored.
-        """
-        self._lookup(key, range_lookup=True)
+            timeout: Maximum seconds to wait after prefetch submission.
 
-    def _lookup(self, key: IPCCacheServerKey, range_lookup: bool) -> None:
+        Returns:
+            Immutable receipt from this exact lookup, or None on timeout.
+            Timed-out jobs remain available through ordinary status endpoints.
+
+        Raises:
+            ValueError: If this lookup was replaced or consumed concurrently.
+        """
+        job = self._lookup(key, range_lookup=True)
+        if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
+            return None
+        consumed = self._consume_prefetch_result(job)
+        if consumed is None:
+            return None
+        if consumed.observation is None:
+            raise ValueError("Range lookup was replaced or consumed concurrently")
+        return consumed.observation
+
+    def _lookup(self, key: IPCCacheServerKey, range_lookup: bool) -> _PrefetchJob:
         model_name, world_size = key.model_name, key.world_size
         self._ctx.event_bus.publish(
             Event(
@@ -263,7 +287,7 @@ class LookupModule(DiscoverableModule):
                 model_name,
                 world_size,
             )
-            self._register_empty_prefetch_job(
+            return self._register_empty_prefetch_job(
                 key,
                 session,
                 generation,
@@ -271,7 +295,6 @@ class LookupModule(DiscoverableModule):
                 early_exit_reason="no_gpu_context",
                 range_lookup=range_lookup,
             )
-            return
 
         assert attn_desc is not None
 
@@ -279,14 +302,13 @@ class LookupModule(DiscoverableModule):
 
         chunk_hashes = list(preparation.chunk_hashes)
         if not chunk_hashes and not range_lookup:
-            self._register_empty_prefetch_job(
+            return self._register_empty_prefetch_job(
                 key,
                 session,
                 generation,
                 early_exit_reason="empty_chunk_hashes",
                 range_lookup=range_lookup,
             )
-            return
 
         # Total chunk-aligned tokens submitted for lookup; surfaces as the
         # denominator of the L1+L2 token-level hit-rate via the
@@ -343,7 +365,7 @@ class LookupModule(DiscoverableModule):
                 model_name,
                 world_size,
             )
-            self._register_empty_prefetch_job(
+            return self._register_empty_prefetch_job(
                 key,
                 session,
                 generation,
@@ -351,7 +373,6 @@ class LookupModule(DiscoverableModule):
                 early_exit_reason="no_group_layout_descs",
                 range_lookup=range_lookup,
             )
-            return
 
         if not self._load_policy.should_load(
             KVLoadContext(
@@ -366,7 +387,7 @@ class LookupModule(DiscoverableModule):
             # and no read lock is taken, so the engine has nothing to release.
             # requested_tokens stays non-zero so hit-rate metrics count the
             # declined tokens as unserved.
-            self._register_empty_prefetch_job(
+            return self._register_empty_prefetch_job(
                 key,
                 session,
                 generation,
@@ -378,7 +399,6 @@ class LookupModule(DiscoverableModule):
                 early_exit_reason="load_policy_recompute",
                 range_lookup=range_lookup,
             )
-            return
 
         # Keep the covered prefix's recency without locking or prefetching
         # it. After the load policy, so a declined lookup leaves no trace.
@@ -392,7 +412,7 @@ class LookupModule(DiscoverableModule):
         if not suffix_hashes:
             # An empty interval has no locks or prefetch work. Report its
             # absolute start, preserving the prefix lookup hit convention.
-            self._register_empty_prefetch_job(
+            return self._register_empty_prefetch_job(
                 key,
                 session,
                 generation,
@@ -403,7 +423,6 @@ class LookupModule(DiscoverableModule):
                 start_chunk=start_chunk,
                 engine_covered_chunks=engine_covered_chunks,
             )
-            return
 
         spec = PrefetchTaskSpec(
             key_groups=ipc_key_to_grouped_object_keys(
@@ -419,29 +438,29 @@ class LookupModule(DiscoverableModule):
             spec,
             external_request_id=key.request_id,
         )
-        self._register_prefetch_job(
-            _PrefetchJob(
-                handle=handle,
-                row_windows=tuple(row.sliding_window_size for row in spec.key_groups),
-                request_id=key.request_id,
-                requested_tokens=looked_up_tokens,
-                session=session,
-                lookup_generation=generation,
-                num_object_groups=attn_desc.num_object_groups,
-                attn_desc=attn_desc,
-                range_lookup=range_lookup,
-                start_chunk=start_chunk,
-                engine_covered_chunks=engine_covered_chunks,
-                prompt_tokens=num_packed_tokens(key.token_bytes),
-                engine_hit_tokens=int(
-                    (key.request_configs or {}).get(
-                        "lmcache.hint.engine_computed_tokens", 0
-                    )
-                ),
-                model_name=model_name,
-                cache_salt=key.cache_salt,
-            )
+        job = _PrefetchJob(
+            handle=handle,
+            row_windows=tuple(row.sliding_window_size for row in spec.key_groups),
+            request_id=key.request_id,
+            requested_tokens=looked_up_tokens,
+            session=session,
+            lookup_generation=generation,
+            num_object_groups=attn_desc.num_object_groups,
+            attn_desc=attn_desc,
+            range_lookup=range_lookup,
+            start_chunk=start_chunk,
+            engine_covered_chunks=engine_covered_chunks,
+            prompt_tokens=num_packed_tokens(key.token_bytes),
+            engine_hit_tokens=int(
+                (key.request_configs or {}).get(
+                    "lmcache.hint.engine_computed_tokens", 0
+                )
+            ),
+            model_name=model_name,
+            cache_salt=key.cache_salt,
         )
+        self._register_prefetch_job(job)
+        return job
 
     @request_handler(HandlerType.BLOCKING)
     def query_prefetch_status(
@@ -472,7 +491,8 @@ class LookupModule(DiscoverableModule):
             )
             return 0
 
-        return self._consume_prefetch_result(job)
+        consumed = self._consume_prefetch_result(job)
+        return consumed.hit_chunks if consumed is not None else None
 
     @request_handler(HandlerType.BLOCKING)
     def wait_prefetch_status(
@@ -506,7 +526,8 @@ class LookupModule(DiscoverableModule):
 
         if not self._ctx.storage_manager.wait_prefetch_status(job.handle, timeout):
             return None
-        return self._consume_prefetch_result(job)
+        consumed = self._consume_prefetch_result(job)
+        return consumed.hit_chunks if consumed is not None else None
 
     @request_handler(HandlerType.BLOCKING)
     def free_lookup_locks(
@@ -687,7 +708,7 @@ class LookupModule(DiscoverableModule):
         engine_covered_chunks: int = 0,
         early_exit_reason: str = "",
         range_lookup: bool = False,
-    ) -> None:
+    ) -> _PrefetchJob:
         """Register a job that resolves immediately without a prefetch.
 
         Args:
@@ -706,37 +727,39 @@ class LookupModule(DiscoverableModule):
                 submitting a prefetch; empty when the lookup simply had
                 nothing to fetch.
         """
-        self._register_prefetch_job(
-            _PrefetchJob(
-                handle=PrefetchHandle(
-                    prefetch_request_id=-1,
-                    external_request_id=key.request_id,
-                    total_requested_keys=0,
-                    submit_time=time.monotonic(),
-                ),
-                row_windows=(),
-                request_id=key.request_id,
-                requested_tokens=requested_tokens,
-                session=session,
-                lookup_generation=lookup_generation,
-                num_object_groups=num_object_groups,
-                attn_desc=attn_desc,
-                start_chunk=start_chunk,
-                engine_covered_chunks=engine_covered_chunks,
-                prompt_tokens=num_packed_tokens(key.token_bytes),
-                engine_hit_tokens=int(
-                    (key.request_configs or {}).get(
-                        "lmcache.hint.engine_computed_tokens", 0
-                    )
-                ),
-                model_name=key.model_name,
-                cache_salt=key.cache_salt,
-                early_exit_reason=early_exit_reason,
-                range_lookup=range_lookup,
-            )
+        job = _PrefetchJob(
+            handle=PrefetchHandle(
+                prefetch_request_id=-1,
+                external_request_id=key.request_id,
+                total_requested_keys=0,
+                submit_time=time.monotonic(),
+            ),
+            row_windows=(),
+            request_id=key.request_id,
+            requested_tokens=requested_tokens,
+            session=session,
+            lookup_generation=lookup_generation,
+            num_object_groups=num_object_groups,
+            attn_desc=attn_desc,
+            start_chunk=start_chunk,
+            engine_covered_chunks=engine_covered_chunks,
+            prompt_tokens=num_packed_tokens(key.token_bytes),
+            engine_hit_tokens=int(
+                (key.request_configs or {}).get(
+                    "lmcache.hint.engine_computed_tokens", 0
+                )
+            ),
+            model_name=key.model_name,
+            cache_salt=key.cache_salt,
+            early_exit_reason=early_exit_reason,
+            range_lookup=range_lookup,
         )
+        self._register_prefetch_job(job)
+        return job
 
-    def _consume_prefetch_result(self, job: _PrefetchJob) -> int | None:
+    def _consume_prefetch_result(
+        self, job: _PrefetchJob
+    ) -> _PrefetchConsumption | None:
         """Hand a finished prefetch result over to the request's session.
 
         Takes the result from the storage manager (each result is returned
@@ -747,9 +770,9 @@ class LookupModule(DiscoverableModule):
         about what a lookup locked.
 
         Returns:
-            The hit chunk count, or None while the prefetch is still running
+            The consumed hit count and receipt, or None while still running
             (the job is kept so a later call can resolve it). Returns zero
-            when the job or its session's lookup generation was replaced.
+            with no receipt when the job or its generation was replaced.
         """
         result = self._ctx.storage_manager.query_prefetch_status(job.handle)
         if result is None:
@@ -777,26 +800,25 @@ class LookupModule(DiscoverableModule):
         # free_lookup_locks can reconstruct which keys the prefetch
         # read-locked (see ``unfold``: full-attention groups lock the whole
         # hit prefix, sliding-window groups only its in-window suffix).
+        observation = LookupObservation(
+            hit_chunks=found_count,
+            l1_resident_keys=tuple(row.popcount() for row in result.l1_hit_cells),
+            l2_loaded_keys=tuple(row.popcount() for row in result.l2_hit_cells),
+        )
         with self._prefetch_job_lock:
             if self._prefetch_jobs.get(job.request_id) is not job:
-                return 0
+                return _PrefetchConsumption(0, None)
             del self._prefetch_jobs[job.request_id]
             if self._ctx.session_manager.get(job.request_id) is not job.session:
-                return 0
+                return _PrefetchConsumption(0, None)
             if not job.session.record_prefetch_result(
                 found_count,
                 tuple(range(job.attn_desc.num_object_groups)),
                 result.l1_owners,
-                observation=LookupObservation(
-                    hit_chunks=found_count,
-                    l1_resident_keys=tuple(
-                        row.popcount() for row in result.l1_hit_cells
-                    ),
-                    l2_loaded_keys=tuple(row.popcount() for row in result.l2_hit_cells),
-                ),
+                observation=observation,
                 lookup_generation=job.lookup_generation,
             ):
-                return 0
+                return _PrefetchConsumption(0, None)
 
         chunk_size = self._ctx.chunk_size
         covered_tokens = job.engine_covered_chunks * chunk_size
@@ -838,7 +860,7 @@ class LookupModule(DiscoverableModule):
             )
         )
 
-        return found_count
+        return _PrefetchConsumption(found_count, observation)
 
     def _active_prefetch_count(self) -> int:
         """Return the number of active prefetch jobs (thread-safe)."""
