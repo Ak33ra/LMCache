@@ -59,7 +59,7 @@ def encode_operation(operation: RpcOperation) -> bytes:
     return msgspec.msgpack.encode(wire_value)
 
 
-def decode_operation(data: bytes) -> RpcOperation:
+def decode_operation(data: bytes | memoryview) -> RpcOperation:
     """Decode a legacy integer ID or string operation name."""
     wire_value: Any = msgspec.msgpack.decode(data)
     if isinstance(wire_value, int):
