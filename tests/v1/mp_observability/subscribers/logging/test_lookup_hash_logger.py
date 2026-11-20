@@ -106,11 +106,13 @@ class TestLookupHashLoggingSubscriber:
         assert Path(config.output_dir).is_dir()
         sub.shutdown()
 
+    @pytest.mark.parametrize("hash_start", [None, 7])
     def test_log_and_shutdown_writes_file(
         self,
         config: LookupHashLogConfig,
         log_dir: Path,
         bus: EventBus,
+        hash_start: int | None,
     ) -> None:
         sub = LookupHashLoggingSubscriber(config)
         bus.register_subscriber(sub)
@@ -118,6 +120,8 @@ class TestLookupHashLoggingSubscriber:
         event = _make_event(
             chunk_hashes=[b"\xab\xcd", b"\x12\x34"],
         )
+        if hash_start is not None:
+            event.metadata["hash_start_chunk"] = hash_start
         _publish_and_drain(bus, event)
         sub.shutdown()
 
@@ -132,6 +136,7 @@ class TestLookupHashLoggingSubscriber:
         assert data["model_name"] == "test-model"
         assert data["chunk_hashes"] == ["0xabcd", "0x1234"]
         assert "timestamp" in data
+        assert data.get("hash_start_chunk") == hash_start
 
     def test_multiple_entries(
         self,
