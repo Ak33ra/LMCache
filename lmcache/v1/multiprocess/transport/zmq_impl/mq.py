@@ -102,7 +102,7 @@ def msgspec_encode(obj: Any, cls: Any) -> bytes:
     return msgspec.msgpack.encode(obj)
 
 
-def msgspec_decode(b_obj: bytes, cls: Any) -> Any:
+def msgspec_decode(b_obj: bytes | memoryview, cls: Any) -> Any:
     # Handle special cases
     if cls in _SPECIAL_ENCODER_DECODERS:
         _, decoder = _SPECIAL_ENCODER_DECODERS[cls]
@@ -380,7 +380,7 @@ class MessageQueueClient:
                             rpc_spec,
                         )
                     self.socket.send_multipart(
-                        [b_request_uid, b_operation] + b_payloads
+                        [b_request_uid, b_operation] + b_payloads, copy=False
                     )
                 except Exception as exc:
                     self.pending_futures.pop(request_uid, None)
@@ -399,7 +399,7 @@ class MessageQueueClient:
         is readable.  Only touches ``pending_futures``, which is
         exclusively accessed from the loop thread.
         """
-        msg = self.socket.recv_multipart()
+        msg = [frame.buffer for frame in self.socket.recv_multipart(copy=False)]
         if len(msg) < 2:
             logger.error(
                 "Malformed response: expected at least 2 message parts "
@@ -900,7 +900,9 @@ class MessageQueueServer(RequestServer):
                 key = (frames_to_send[0], frames_to_send[1])
                 try:
                     self.socket.send_multipart(
-                        frames_to_send, flags=zmq.NOBLOCK if self._limits else 0
+                        frames_to_send,
+                        flags=zmq.NOBLOCK if self._limits else 0,
+                        copy=False,
                     )
                 except zmq.ZMQError as error:
                     if self._limits is not None and error.errno == zmq.EAGAIN:
