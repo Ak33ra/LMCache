@@ -318,10 +318,8 @@ def run_cache_server(
                 "transfer, empty shm_name, and the default engine without "
                 "P2P, extensions, run_script or storage trace capture"
             )
-        mp_config.request_limits = RequestLimits(
-            max_payload_bytes=8 << 20,
-            max_inflight_requests=4,
-            max_workspace_bytes=32 << 20,
+        mp_config.request_limits = RequestLimits.for_partition(
+            storage_manager_config.partition.staging_bytes
         )
 
     # Before any event IPC backend is resolved (KV-cache registration), so

@@ -24,6 +24,26 @@ class RequestLimits:
     max_inflight_requests: int
     max_workspace_bytes: int
 
+    @classmethod
+    def for_partition(cls, staging_bytes: int) -> "RequestLimits":
+        """Derive bounded inline admission from a partition's staging reserve.
+
+        Args:
+            staging_bytes: Positive configured temporary-cache reserve in bytes.
+
+        Returns:
+            Four request credits, a wire ceiling of half the reserve clamped
+            to 8--64 MiB, and a per-handler workspace ceiling four times that.
+            These auxiliary limits are separate from managed cache backing.
+
+        Raises:
+            ValueError: If staging_bytes is not a positive integer.
+        """
+        if type(staging_bytes) is not int or staging_bytes <= 0:
+            raise ValueError("Partition staging bytes must be a positive integer")
+        payload_bytes = max(8 << 20, min(64 << 20, staging_bytes // 2))
+        return cls(payload_bytes, 4, 4 * payload_bytes)
+
     def __post_init__(self) -> None:
         if (
             type(self.max_payload_bytes) is not int
