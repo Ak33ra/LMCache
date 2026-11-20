@@ -457,3 +457,76 @@ def test_overlapping_lookup_keeps_its_own_covered_keys():
     ]
     assert session.get_lookup_observation() is observation
     assert module.query_prefetch_status("r") == 0
+
+
+def test_range_lookup_preserves_identity_without_covered_touches():
+    """Independent tiles submit only their identities and touch once at end."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.lookup import LookupModule
+
+    ctx = _lookup_ctx(8)
+    module = LookupModule(ctx)
+    for end in (2, 4, 6, 8):
+        key = _make_key(end, start_chunks=end - 2)
+        module.lookup_range(key, 1)
+        spec = ctx.storage_manager.submit_prefetch_task.call_args.args[0]
+        expected = ipc_key_to_object_keys(
+            key,
+            ctx.session_manager.get("r").hasher.compute_packed_chunk_hashes(
+                key.token_bytes, start=key.start, end=key.end
+            ),
+            [0],
+        )[0]
+        assert spec.key_groups[0].keys == expected
+        ctx.storage_manager.touch_cached_keys.assert_not_called()
+    module.end_session("r")
+    touched = ctx.storage_manager.touch_cached_keys.call_args.args[0]
+    assert len(touched) == 8
+
+
+@pytest.mark.parametrize("found", [0, 1, 2])
+def test_range_lookup_receipt_is_absolute_and_not_apc(found: int) -> None:
+    """Partial hits keep the absolute boundary without claiming APC coverage."""
+    # First Party
+    from lmcache.lmcache_native import Bitmap
+    from lmcache.v1.distributed.api import AttnWindowDesc, PrefetchResult
+    from lmcache.v1.mp_observability.event import EventType
+    from lmcache.v1.multiprocess.modules.lookup import LookupModule
+
+    ctx = _lookup_ctx(6)
+    ctx.layout_desc_registry.find_attn_desc.return_value = AttnWindowDesc([-1], 1)
+    ctx.storage_manager.query_prefetch_status.return_value = PrefetchResult(
+        hit_cells=[Bitmap(2, found)],
+        l1_hit_cells=[Bitmap(2, found)],
+        l2_hit_cells=[Bitmap(2)],
+    )
+    module = LookupModule(ctx)
+    module.lookup_range(_make_key(6, start_chunks=4), 1)
+    assert module.query_prefetch_status("r") == 4 + found
+    observation = ctx.session_manager.get("r").get_lookup_observation()
+    assert observation.hit_chunks == 4 + found
+    assert observation.l1_resident_keys == (found,)
+    event = next(
+        call.args[0]
+        for call in ctx.event_bus.publish.call_args_list
+        if call.args[0].event_type == EventType.MP_LOOKUP_PREFETCH_END
+    )
+    assert event.metadata["apc_covered_tokens"] == 0
+    assert "prompt_tokens" not in event.metadata
+    assert "request_hit_tokens" not in event.metadata
+    assert event.metadata["requested_tokens"] == 2 * CHUNK_SIZE
+
+
+def test_declined_range_reports_its_start() -> None:
+    """Declining an independent interval is an empty hit at that interval."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.lookup import LookupModule
+
+    ctx = _lookup_ctx(6)
+    policy = MagicMock()
+    policy.should_load.return_value = False
+    module = LookupModule(ctx, policy)
+    module.lookup_range(_make_key(6, start_chunks=4), 1)
+    assert module.query_prefetch_status("r") == 4
+    ctx.storage_manager.submit_prefetch_task.assert_not_called()
+    ctx.storage_manager.touch_cached_keys.assert_not_called()

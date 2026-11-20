@@ -131,6 +131,7 @@ _GRPC_SERVER_MODES = ["sync", "aio", _NATIVE_MODE]
 @dataclass
 class _Calls:
     lookup: tuple[IPCCacheServerKey, int] | None = None
+    lookup_range: tuple[IPCCacheServerKey, int] | None = None
     allocation: tuple[int, str, list[BlockAllocationRecord]] | None = None
     clear_force: bool | None = None
     chunk_negotiation: int | None = None
@@ -146,6 +147,10 @@ def grpc_client(
         @request_handler(HandlerType.BLOCKING)
         def lookup(self, key: IPCCacheServerKey, tp_size: int) -> None:
             calls.lookup = (key, tp_size)
+
+        @request_handler(HandlerType.BLOCKING)
+        def lookup_range(self, key: IPCCacheServerKey, tp_size: int) -> None:
+            calls.lookup_range = (key, tp_size)
 
         @request_handler(
             HandlerType.BLOCKING,
@@ -629,6 +634,8 @@ def test_generated_grpc_services_communicate_end_to_end(
 
     assert client.lookup(key, 2).result(timeout=5) is None
     assert calls.lookup == (key, 2)
+    assert client.lookup_range(key, 2).result(timeout=5) is None
+    assert calls.lookup_range == (key, 2)
     assert client.store(key, 7, [[1, 2], [3]], b"input-event").result(5) == (
         b"output-event",
         True,

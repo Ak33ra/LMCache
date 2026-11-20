@@ -755,6 +755,60 @@ class TestHitRateAttributes:
         assert root.attributes["engine_hit_rate"] == 0.0
         assert root.attributes["request_hit_rate"] == 0.0
 
+    def test_range_does_not_claim_request_hit_rate(self, exporter):
+        """Independent ranges leave unavailable request-level rates unset."""
+        bus = EventBus(EventBusConfig(enabled=True, max_queue_size=100))
+        registry = SpanRegistry()
+        bus.register_subscriber(MPServerTracingSubscriber(registry))
+        bus.start()
+        now = time.time()
+        sid = "req-hr-zero"
+
+        bus.publish(
+            Event(event_type=EventType.MP_REQUEST_START, session_id=sid, timestamp=now)
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.MP_LOOKUP_PREFETCH_START,
+                session_id=sid,
+                timestamp=now + 0.001,
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.MP_LOOKUP_PREFETCH_END,
+                session_id=sid,
+                timestamp=now + 0.010,
+                metadata={
+                    "range_lookup": True,
+                    "hit_tokens": 0,
+                    "requested_tokens": 0,
+                    "found_count": 0,
+                    "l1_hit_tokens": 0,
+                    "l2_hit_tokens": 0,
+                    "early_exit_reason": "",
+                },
+            )
+        )
+        bus.publish(
+            Event(
+                event_type=EventType.MP_REQUEST_END,
+                session_id=sid,
+                timestamp=now + 0.020,
+            )
+        )
+        time.sleep(0.15)
+        bus.stop()
+
+        root = _root_span(exporter, sid)
+        assert root is not None
+        assert root.attributes["hit_tokens"] == 0
+        assert root.attributes["requested_tokens"] == 0
+        assert root.attributes["hit_rate"] == 0.0
+        assert "prompt_tokens" not in root.attributes
+        assert "engine_hit_rate" not in root.attributes
+        assert "request_hit_rate" not in root.attributes
+
     def test_request_level_attrs_set_on_root_span(self, exporter):
         """LP_END with prompt_tokens=2000, engine_hit_tokens=500 and
         request_hit_tokens=1500 → engine_hit_rate=0.25, request_hit_rate=0.75."""

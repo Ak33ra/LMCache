@@ -139,6 +139,8 @@ def test_named_rpc_method_delegates_to_zmq_request_envelope() -> None:
 
     assert future.result(timeout=0) == "lookup"
     assert transport.calls == [("lookup", ["key", 4])]
+    assert client.lookup_range(cast(Any, "key"), 4).result(0) == "lookup_range"
+    assert transport.calls[-1] == ("lookup_range", ["key", 4])
 
     client.subscribe_kv_events(9, "model", cursor=7, max_events=16)
     assert transport.calls[-1] == ("subscribe_kv_events", [9, "model", 7, 16])
