@@ -14,6 +14,8 @@ backend:
 """
 
 # Standard
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from typing import Any, cast
 from unittest.mock import MagicMock
 import importlib.util
@@ -23,7 +25,7 @@ import threading
 import pytest
 
 # First Party
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import ObjectKey, ipc_key_to_object_keys
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
 from lmcache.v1.multiprocess.session import SessionManager
@@ -409,3 +411,49 @@ def test_repeated_session_lookup_refreshes_entire_covered_prefix():
     assert ctx.session_manager.get("r") is None
     assert ctx.storage_manager.touch_cached_keys.call_count == 3
     assert ctx.storage_manager.touch_cached_keys.call_args.args[0] == second_touch
+
+
+def test_overlapping_lookup_keeps_its_own_covered_keys():
+    """A later lookup cannot replace an earlier lookup's touch identities."""
+    # First Party
+    from lmcache.v1.multiprocess.modules.lookup import LookupModule
+
+    ctx = _lookup_ctx(4)
+    policy = MagicMock()
+    first_prepared = threading.Event()
+    release_first = threading.Event()
+
+    def should_load(context):
+        if context.model_name == "first":
+            first_prepared.set()
+            if not release_first.wait(5):
+                raise TimeoutError("Concurrent lookup did not complete")
+        return True
+
+    policy.should_load.side_effect = should_load
+    module = LookupModule(ctx, policy)
+    first = replace(_make_key(4, start_chunks=4), model_name="first")
+    second = replace(first, model_name="second", token_bytes=pack_token_ids([42] * 64))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        pending = executor.submit(module.lookup, first, 1)
+        try:
+            assert first_prepared.wait(5)
+            executor.submit(module.lookup, second, 1).result(timeout=5)
+            assert module.query_prefetch_status("r") == 4
+            session = ctx.session_manager.get("r")
+            observation = session.get_lookup_observation()
+        finally:
+            release_first.set()
+        pending.result(timeout=5)
+    touches = [
+        call.args[0] for call in ctx.storage_manager.touch_cached_keys.call_args_list
+    ]
+    hasher = TokenHasher(CHUNK_SIZE, "blake3")
+    assert touches == [
+        ipc_key_to_object_keys(
+            key, hasher.compute_packed_chunk_hashes(key.token_bytes), [0]
+        )[0]
+        for key in (second, first)
+    ]
+    assert session.get_lookup_observation() is observation
+    assert module.query_prefetch_status("r") == 0

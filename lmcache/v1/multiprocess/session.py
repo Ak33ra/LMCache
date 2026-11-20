@@ -41,6 +41,15 @@ class LookupObservation:
     l2_loaded_keys: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class LookupPreparation:
+    """Immutable key metadata bound to one lookup generation."""
+
+    generation: int
+    chunk_hashes: tuple[bytes, ...]
+    covered_object_keys: tuple[ObjectKey, ...]
+
+
 @dataclass
 class Session:
     """Tracks accumulated token IDs and computed chunk hashes for a request.
@@ -77,7 +86,8 @@ class Session:
     _failed_retrieve_releases: set[tuple[int, int, int, int, int]] = field(
         default_factory=set, repr=False
     )
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Lookup preparation composes the public token/key operations atomically.
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def set_tokens(self, packed_token_ids: bytes) -> None:
         """Update the token sequence (idempotent, replaces not extends).
@@ -250,6 +260,47 @@ class Session:
             self.last_prefix_hash = h
             self.chunk_hashes.append(h)
             self.num_chunks_processed += 1
+
+    def prepare_lookup(
+        self,
+        key: IPCCacheServerKey,
+        group_windows: tuple[int, ...],
+        covered_group_ids: list[int],
+    ) -> LookupPreparation:
+        """Bind a generation and immutable metadata to the exact lookup key.
+
+        Concurrent lookups or transfers may replace session tokens after this
+        method returns. Its snapshot remains valid for constructing this
+        lookup's prefetch and covered-prefix touch; generation checks still
+        govern whether its eventual result can be published.
+
+        Args:
+            key: Complete token prefix, range and identity for the lookup.
+            group_windows: Attention windows recorded for later lock release.
+            covered_group_ids: Object groups whose covered prefix is touched.
+
+        Returns:
+            Lookup generation, complete aligned hashes, and covered keys.
+        """
+        with self._lock:
+            self.set_tokens(key.token_bytes)
+            generation = self.begin_lookup(key, group_windows)
+            end = min(key.num_tokens, key.end)
+            end -= end % self.hasher.chunk_size
+            hashes = tuple(
+                TokenHasher.hash_to_bytes(h) for h in self.get_hashes(0, end)
+            )
+            start = min(max(0, key.start // self.hasher.chunk_size), len(hashes))
+            covered = (
+                self.get_object_keys(
+                    key, 0, start * self.hasher.chunk_size, covered_group_ids
+                )
+                if start and covered_group_ids
+                else []
+            )
+            return LookupPreparation(
+                generation, hashes, tuple(obj for group in covered for obj in group)
+            )
 
     def begin_lookup(
         self,

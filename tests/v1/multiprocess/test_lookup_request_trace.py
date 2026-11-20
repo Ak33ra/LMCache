@@ -25,7 +25,10 @@ def test_lookup_event_carries_key_token_ids():
         num_chunks_in_sw=[-1], world_size=1
     )
     ctx.layout_desc_registry.find_group_layout_descs.return_value = {}
-    ctx.session_manager.get_or_create.return_value.get_hashes.return_value = [b"h"]
+    preparation = (
+        ctx.session_manager.get_or_create.return_value.prepare_lookup.return_value
+    )
+    preparation.chunk_hashes = [b"h"]
     key = IPCCacheServerKey.from_token_ids(
         model_name="m",
         world_size=1,

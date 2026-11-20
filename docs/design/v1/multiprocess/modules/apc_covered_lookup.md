@@ -126,3 +126,9 @@ starts a fresh generation and clears the prior observation and read owners.
 Callers that perform sequential tiled reads must finish each tile's retrieval
 before beginning the next lookup, then end the session once after the complete
 logical read. Session expiry retains its existing creation-time TTL.
+
+Lookup preparation binds the token prefix, lookup generation, hashes and
+covered object keys atomically under the session lock. The returned immutable
+snapshot remains tied to that key if an overlapping lookup or transfer replaces
+the session tokens. A stale lookup can still finish its own work, but the
+existing generation check prevents it from publishing over the current lookup.

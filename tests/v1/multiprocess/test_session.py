@@ -441,3 +441,23 @@ class TestSessionObjectKeys:
         )
         with pytest.raises(ValueError):
             session.get_object_keys(key, 0, 16, [0])
+
+    def test_lookup_snapshot_survives_replacement(self, session: Session) -> None:
+        first = replace(self.key(list(range(12))), start=4)
+        prepared = session.prepare_lookup(first, (-1,), [0])
+        second = replace(self.key([42] * 12), start=8, cache_salt="second")
+        replacement = session.prepare_lookup(second, (-1,), [0])
+        assert prepared.chunk_hashes == tuple(
+            session.hasher.compute_chunk_hashes(list(range(12)))
+        )
+        assert prepared.covered_object_keys == tuple(
+            ipc_key_to_object_keys(first, list(prepared.chunk_hashes[:1]), [0])[0]
+        )
+        assert replacement.chunk_hashes == tuple(
+            session.hasher.compute_chunk_hashes([42] * 12)
+        )
+        assert not session.is_lookup_current(prepared.generation)
+        assert session.is_lookup_current(replacement.generation)
+        assert not session.record_prefetch_result(
+            3, (), lookup_generation=prepared.generation
+        )

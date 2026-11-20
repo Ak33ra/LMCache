@@ -37,7 +37,6 @@ from lmcache.v1.multiprocess.kv_load_policy import (
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.session import LookupObservation, Session
 from lmcache.v1.multiprocess.token_codec import num_packed_tokens, unpack_token_ids
-from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
 logger = init_logger(__name__)
 
@@ -229,10 +228,12 @@ class LookupModule(DiscoverableModule):
             else None
         )
         session = self._ctx.session_manager.get_or_create(key.request_id)
-        session.set_tokens(key.token_bytes)
-        generation = session.begin_lookup(
-            key, tuple(attn_desc.num_chunks_in_sw) if attn_desc is not None else ()
+        preparation = session.prepare_lookup(
+            key,
+            tuple(attn_desc.num_chunks_in_sw) if attn_desc is not None else (),
+            list(range(attn_desc.num_object_groups)) if attn_desc is not None else [],
         )
+        generation = preparation.generation
         if layout_desc is None:
             logger.error(
                 "No GPU context found for model %s with world size %d during lookup!",
@@ -248,11 +249,7 @@ class LookupModule(DiscoverableModule):
 
         num_kv_readers = key.require_num_kv_readers()
 
-        hash_end = min(key.num_tokens, key.end)
-        hash_end -= hash_end % self._ctx.chunk_size
-        chunk_hashes = [
-            TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0, hash_end)
-        ]
+        chunk_hashes = list(preparation.chunk_hashes)
         if not chunk_hashes:
             self._register_empty_prefetch_job(
                 key, session, generation, early_exit_reason="empty_chunk_hashes"
@@ -336,16 +333,7 @@ class LookupModule(DiscoverableModule):
         # it. After the load policy, so a declined lookup leaves no trace.
         if start_chunk:
             self._ctx.storage_manager.touch_cached_keys(
-                [
-                    obj_key
-                    for group_keys in session.get_object_keys(
-                        key,
-                        0,
-                        start_chunk * self._ctx.chunk_size,
-                        list(range(attn_desc.num_object_groups)),
-                    )
-                    for obj_key in group_keys
-                ]
+                list(preparation.covered_object_keys)
             )
 
         # Prefetch only [start, end); status offsets hits back to absolute.
