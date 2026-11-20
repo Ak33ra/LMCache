@@ -126,6 +126,7 @@ class _PrefetchJob:
     # Names the ``lookup()`` branch that returned before submitting a prefetch
     # task; empty on the normal path.
     early_exit_reason: str = ""
+    range_lookup: bool = False
 
 
 class LookupModule(DiscoverableModule):
@@ -207,6 +208,27 @@ class LookupModule(DiscoverableModule):
             key: Cache key with request_id embedded.
             tp_size: Legacy wire field; ignored (kept for payload arity).
         """
+        self._lookup(key, range_lookup=False)
+
+    @request_handler(HandlerType.BLOCKING)
+    def lookup_range(self, key: IPCCacheServerKey, tp_size: int) -> None:
+        """Submit an independent interval within a logical request.
+
+        Unlike lookup, start denotes the interval boundary, not an
+        engine-owned APC prefix. Only [start, end) is prefetched;
+        earlier chunks are not touched. Rolling hash identity, absolute hit
+        counts, receipt generations and owner tracking retain lookup semantics.
+        Session end still refreshes the complete retained token prefix once.
+        Calls may cover arbitrary intervals; no successful-consumption cursor
+        or claim about retrieval of earlier intervals is implied.
+
+        Args:
+            key: Complete token prefix and requested interval.
+            tp_size: Legacy wire field; ignored.
+        """
+        self._lookup(key, range_lookup=True)
+
+    def _lookup(self, key: IPCCacheServerKey, range_lookup: bool) -> None:
         model_name, world_size = key.model_name, key.world_size
         self._ctx.event_bus.publish(
             Event(
@@ -232,6 +254,7 @@ class LookupModule(DiscoverableModule):
             key,
             tuple(attn_desc.num_chunks_in_sw) if attn_desc is not None else (),
             list(range(attn_desc.num_object_groups)) if attn_desc is not None else [],
+            range_lookup=range_lookup,
         )
         generation = preparation.generation
         if layout_desc is None:
@@ -241,7 +264,12 @@ class LookupModule(DiscoverableModule):
                 world_size,
             )
             self._register_empty_prefetch_job(
-                key, session, generation, early_exit_reason="no_gpu_context"
+                key,
+                session,
+                generation,
+                start_chunk=key.start // self._ctx.chunk_size if range_lookup else 0,
+                early_exit_reason="no_gpu_context",
+                range_lookup=range_lookup,
             )
             return
 
@@ -250,9 +278,13 @@ class LookupModule(DiscoverableModule):
         num_kv_readers = key.require_num_kv_readers()
 
         chunk_hashes = list(preparation.chunk_hashes)
-        if not chunk_hashes:
+        if not chunk_hashes and not range_lookup:
             self._register_empty_prefetch_job(
-                key, session, generation, early_exit_reason="empty_chunk_hashes"
+                key,
+                session,
+                generation,
+                early_exit_reason="empty_chunk_hashes",
+                range_lookup=range_lookup,
             )
             return
 
@@ -284,10 +316,17 @@ class LookupModule(DiscoverableModule):
                 )
             )
 
-        start_chunk = min(max(0, key.start // self._ctx.chunk_size), len(chunk_hashes))
+        start_chunk = (
+            key.start // self._ctx.chunk_size
+            if range_lookup
+            else min(max(0, key.start // self._ctx.chunk_size), len(chunk_hashes))
+        )
+        engine_covered_chunks = 0 if range_lookup else start_chunk
         # The engine-covered prefix is never looked up, so it is excluded from
         # the hit-rate denominator and reported separately.
-        looked_up_tokens = requested_tokens - start_chunk * self._ctx.chunk_size
+        looked_up_tokens = (
+            requested_tokens - engine_covered_chunks * self._ctx.chunk_size
+        )
 
         group_layout_descs = self._ctx.layout_desc_registry.find_group_layout_descs(
             model_name, world_size
@@ -300,7 +339,12 @@ class LookupModule(DiscoverableModule):
                 world_size,
             )
             self._register_empty_prefetch_job(
-                key, session, generation, early_exit_reason="no_group_layout_descs"
+                key,
+                session,
+                generation,
+                start_chunk=start_chunk if range_lookup else 0,
+                early_exit_reason="no_group_layout_descs",
+                range_lookup=range_lookup,
             )
             return
 
@@ -324,23 +368,25 @@ class LookupModule(DiscoverableModule):
                 requested_tokens=looked_up_tokens,
                 num_object_groups=attn_desc.num_object_groups,
                 attn_desc=attn_desc,
-                engine_covered_chunks=start_chunk,
+                engine_covered_chunks=engine_covered_chunks,
+                start_chunk=start_chunk if range_lookup else 0,
                 early_exit_reason="load_policy_recompute",
+                range_lookup=range_lookup,
             )
             return
 
         # Keep the covered prefix's recency without locking or prefetching
         # it. After the load policy, so a declined lookup leaves no trace.
-        if start_chunk:
+        if preparation.covered_object_keys:
             self._ctx.storage_manager.touch_cached_keys(
                 list(preparation.covered_object_keys)
             )
 
         # Prefetch only [start, end); status offsets hits back to absolute.
-        suffix_hashes = chunk_hashes[start_chunk:]
+        suffix_hashes = chunk_hashes if range_lookup else chunk_hashes[start_chunk:]
         if not suffix_hashes:
-            # Everything is engine-covered: nothing to lock or prefetch. The
-            # empty job still reports the covered prefix as the hit.
+            # An empty interval has no locks or prefetch work. Report its
+            # absolute start, preserving the prefix lookup hit convention.
             self._register_empty_prefetch_job(
                 key,
                 session,
@@ -348,8 +394,9 @@ class LookupModule(DiscoverableModule):
                 requested_tokens=looked_up_tokens,
                 num_object_groups=attn_desc.num_object_groups,
                 attn_desc=attn_desc,
+                range_lookup=range_lookup,
                 start_chunk=start_chunk,
-                engine_covered_chunks=start_chunk,
+                engine_covered_chunks=engine_covered_chunks,
             )
             return
 
@@ -377,8 +424,9 @@ class LookupModule(DiscoverableModule):
                 lookup_generation=generation,
                 num_object_groups=attn_desc.num_object_groups,
                 attn_desc=attn_desc,
+                range_lookup=range_lookup,
                 start_chunk=start_chunk,
-                engine_covered_chunks=start_chunk,
+                engine_covered_chunks=engine_covered_chunks,
                 prompt_tokens=num_packed_tokens(key.token_bytes),
                 engine_hit_tokens=int(
                     (key.request_configs or {}).get(
@@ -633,6 +681,7 @@ class LookupModule(DiscoverableModule):
         start_chunk: int = 0,
         engine_covered_chunks: int = 0,
         early_exit_reason: str = "",
+        range_lookup: bool = False,
     ) -> None:
         """Register a job that resolves immediately without a prefetch.
 
@@ -647,6 +696,7 @@ class LookupModule(DiscoverableModule):
                 hit when everything below it is engine-covered.
             engine_covered_chunks: Engine-covered chunks below ``key.start``,
                 reported as ``apc_covered_tokens``.
+            range_lookup: Omit request-wide metrics for independent intervals.
             early_exit_reason: The ``lookup()`` branch that returned before
                 submitting a prefetch; empty when the lookup simply had
                 nothing to fetch.
@@ -677,6 +727,7 @@ class LookupModule(DiscoverableModule):
                 model_name=key.model_name,
                 cache_salt=key.cache_salt,
                 early_exit_reason=early_exit_reason,
+                range_lookup=range_lookup,
             )
         )
 
@@ -754,6 +805,7 @@ class LookupModule(DiscoverableModule):
                 session_id=job.request_id,
                 metadata={
                     "found_count": found_count,
+                    "range_lookup": job.range_lookup,
                     "requested_tokens": job.requested_tokens,
                     # Hit-rate counters cover only the looked-up range; the
                     # engine-covered prefix gets its own field.
@@ -763,9 +815,15 @@ class LookupModule(DiscoverableModule):
                     "l2_hit_tokens": l2_chunks * chunk_size,
                     # Request-level view: the whole prompt as denominator and
                     # what the engine plus LMCache served as numerator.
-                    "prompt_tokens": job.prompt_tokens,
-                    "engine_hit_tokens": job.engine_hit_tokens,
-                    "request_hit_tokens": request_hit_tokens,
+                    **(
+                        {
+                            "prompt_tokens": job.prompt_tokens,
+                            "engine_hit_tokens": job.engine_hit_tokens,
+                            "request_hit_tokens": request_hit_tokens,
+                        }
+                        if not job.range_lookup
+                        else {}
+                    ),
                     "l1_hit_keys": result.l1_hit_count,
                     "l2_hit_keys": result.l2_hit_count,
                     "early_exit_reason": job.early_exit_reason,

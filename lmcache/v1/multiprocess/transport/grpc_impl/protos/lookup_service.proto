@@ -54,6 +54,7 @@ message EndSessionResponse {}
 
 service LookupService {
   rpc Lookup(LookupRequest) returns (LookupResponse);
+  rpc LookupRange(LookupRequest) returns (LookupResponse);
   rpc QueryPrefetchStatus(QueryPrefetchStatusRequest)
       returns (QueryPrefetchStatusResponse);
   rpc WaitPrefetchStatus(WaitPrefetchStatusRequest)

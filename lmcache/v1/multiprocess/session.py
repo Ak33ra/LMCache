@@ -295,6 +295,7 @@ class Session:
         key: IPCCacheServerKey,
         group_windows: tuple[int, ...],
         covered_group_ids: list[int],
+        range_lookup: bool = False,
     ) -> LookupPreparation:
         """Bind a generation and immutable metadata to the exact lookup key.
 
@@ -307,28 +308,47 @@ class Session:
             key: Complete token prefix, range and identity for the lookup.
             group_windows: Attention windows recorded for later lock release.
             covered_group_ids: Object groups whose covered prefix is touched.
+            range_lookup: Return only the requested interval and omit covered
+                prefix recency work. Default preserves engine APC semantics.
 
         Returns:
-            Lookup generation, complete aligned hashes, and covered keys.
+            Lookup generation, aligned hashes and covered keys.
+
+        Raises:
+            ValueError: If a range lookup has invalid or unaligned bounds.
         """
+        if range_lookup and (
+            key.start < 0
+            or key.start > key.end
+            or key.end > key.num_tokens
+            or key.start % self.hasher.chunk_size
+            or key.end % self.hasher.chunk_size
+        ):
+            raise ValueError("Range lookup must cover held, complete chunks")
         with self._lock:
             self.set_tokens(key.token_bytes)
             generation = self.begin_lookup(key, group_windows)
             end = min(key.num_tokens, key.end)
             end -= end % self.hasher.chunk_size
-            hashes = tuple(
-                TokenHasher.hash_to_bytes(h) for h in self.get_hashes(0, end)
+            start = min(
+                max(0, key.start // self.hasher.chunk_size),
+                end // self.hasher.chunk_size,
             )
-            start = min(max(0, key.start // self.hasher.chunk_size), len(hashes))
+            hash_start = start * self.hasher.chunk_size if range_lookup else 0
+            hashes = tuple(
+                TokenHasher.hash_to_bytes(h) for h in self.get_hashes(hash_start, end)
+            )
             covered = (
                 self.get_object_keys(
                     key, 0, start * self.hasher.chunk_size, covered_group_ids
                 )
-                if start and covered_group_ids
+                if not range_lookup and start and covered_group_ids
                 else []
             )
             return LookupPreparation(
-                generation, hashes, tuple(obj for group in covered for obj in group)
+                generation,
+                hashes,
+                tuple(obj for group in covered for obj in group),
             )
 
     def begin_lookup(

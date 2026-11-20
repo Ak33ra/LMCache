@@ -515,3 +515,51 @@ def test_transfer_identity_resolution_is_atomic(hasher: TokenHasher) -> None:
             key.token_bytes, start=key.start, end=key.end
         )
         assert result == ipc_key_to_object_keys(key, hashes, [0, 1])
+
+
+def test_range_preparation_copies_only_requested_hashes(session: Session) -> None:
+    """Rolling identity is retained without copying earlier tile hashes."""
+    sliced_chunks: list[int] = []
+
+    class CountedHashes(list):
+        def __getitem__(self, index):
+            result = super().__getitem__(index)
+            if isinstance(index, slice):
+                sliced_chunks.append(len(result))
+            return result
+
+    session.chunk_hashes = CountedHashes()
+    expected = session.hasher.compute_chunk_hashes(list(range(64)))
+    for start in range(0, 64, 4):
+        key = IPCCacheServerKey.from_token_ids(
+            model_name="model",
+            world_size=1,
+            worker_id=None,
+            token_ids=list(range(start + 4)),
+            start=start,
+            end=start + 4,
+            request_id=session.request_id,
+            num_kv_readers=1,
+        )
+        prepared = session.prepare_lookup(key, (-1,), [0], range_lookup=True)
+        assert prepared.chunk_hashes == (expected[start // 4],)
+        assert prepared.covered_object_keys == ()
+    assert sliced_chunks == [1] * 16
+
+
+@pytest.mark.parametrize("start,end", [(-4, 8), (8, 4), (1, 8), (0, 9), (0, 16)])
+def test_range_preparation_rejects_invalid_bounds(
+    session: Session, start: int, end: int
+) -> None:
+    key = IPCCacheServerKey.from_token_ids(
+        model_name="model",
+        world_size=1,
+        worker_id=None,
+        token_ids=list(range(12)),
+        start=start,
+        end=end,
+        request_id=session.request_id,
+    )
+    with pytest.raises(ValueError, match="complete chunks"):
+        session.prepare_lookup(key, (-1,), [0], range_lookup=True)
+    assert session.tokens == b""
